@@ -1,0 +1,1866 @@
+/**
+ * @file nav_ball_collector_node.cpp
+ * @brief Implementation of navigation-enabled ball collector node
+ * 
+ * This node uses Nav2 for intelligent path planning to reach balls
+ * while avoiding obstacles based on the map created during SLAM.
+ */
+
+#include "ballvac_ball_collector/nav_ball_collector_node.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace ballvac_ball_collector
+{
+
+// =============================================================================
+// Constructor
+// =============================================================================
+
+NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
+: Node("nav_ball_collector_node", options),
+  current_state_(NavCollectorState::IDLE),
+  pose_received_(false),
+  navigation_in_progress_(false),
+  navigation_succeeded_(false),
+  consecutive_rejections_(0),
+  exploration_waypoint_index_(0),
+  recover_phase_(0),
+  recover_turn_direction_(1.0),
+  last_min_front_range_(10.0),
+  stuck_count_(0),
+  delete_pending_(false),
+  delete_attempt_(0)
+{
+    // -------------------------------------------------------------------------
+    // Declare and get parameters
+    // -------------------------------------------------------------------------
+    
+    // Topic parameters
+    this->declare_parameter<std::string>("scan_topic", "/scan");
+    scan_topic_ = this->get_parameter("scan_topic").as_string();
+    
+    this->declare_parameter<std::string>("detection_topic", "/ball_detections");
+    detection_topic_ = this->get_parameter("detection_topic").as_string();
+    
+    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel");
+    cmd_topic_ = this->get_parameter("cmd_topic").as_string();
+    
+    this->declare_parameter<std::string>("odom_topic", "/odom");
+    odom_topic_ = this->get_parameter("odom_topic").as_string();
+    
+    this->declare_parameter<std::string>("delete_service", "/world/my_world/remove");
+    delete_service_ = this->get_parameter("delete_service").as_string();
+    
+    this->declare_parameter<std::string>("spawn_service", "/world/my_world/create");
+    spawn_service_ = this->get_parameter("spawn_service").as_string();
+    
+    // Frame parameters
+    this->declare_parameter<std::string>("map_frame", "map");
+    map_frame_ = this->get_parameter("map_frame").as_string();
+    
+    this->declare_parameter<std::string>("robot_frame", "ballvac");
+    robot_frame_ = this->get_parameter("robot_frame").as_string();
+    
+    this->declare_parameter<std::string>("camera_frame", "ballvac/camera_link");
+    camera_frame_ = this->get_parameter("camera_frame").as_string();
+    
+    // Control parameters
+    this->declare_parameter<double>("collect_distance_m", 0.4);
+    collect_distance_m_ = this->get_parameter("collect_distance_m").as_double();
+    
+    this->declare_parameter<double>("obstacle_stop_m", 0.8);  // Increased from 0.5 for earlier stop
+    obstacle_stop_m_ = this->get_parameter("obstacle_stop_m").as_double();
+    
+    this->declare_parameter<double>("obstacle_slow_m", 1.8);  // Increased from 1.0 for earlier avoidance
+    obstacle_slow_m_ = this->get_parameter("obstacle_slow_m").as_double();
+    
+    this->declare_parameter<double>("obstacle_avoid_m", 2.5);  // NEW: Distance to start steering away
+    obstacle_avoid_m_ = this->get_parameter("obstacle_avoid_m").as_double();
+    
+    this->declare_parameter<double>("approach_speed", 0.8);  // Increased from 0.3 for faster approach
+    approach_speed_ = this->get_parameter("approach_speed").as_double();
+    
+    this->declare_parameter<double>("max_steer", 1.5);  // Increased from 0.5 for sharper turns
+    max_steer_ = this->get_parameter("max_steer").as_double();
+    
+    this->declare_parameter<double>("control_rate", 20.0);
+    control_rate_ = this->get_parameter("control_rate").as_double();
+    
+    // Approach parameters
+    this->declare_parameter<double>("steering_gain", 3.0);  // Increased from 2.0 for more responsive steering
+    steering_gain_ = this->get_parameter("steering_gain").as_double();
+    
+    this->declare_parameter<double>("approach_radius_threshold", 150.0);
+    approach_radius_threshold_ = this->get_parameter("approach_radius_threshold").as_double();
+    
+    this->declare_parameter<double>("nav_to_approach_distance", 1.5);
+    nav_to_approach_distance_ = this->get_parameter("nav_to_approach_distance").as_double();
+    
+    // Recovery parameters
+    this->declare_parameter<double>("recover_duration", 1.5);  // Increased from 0.8 for more backup time
+    recover_duration_ = this->get_parameter("recover_duration").as_double();
+    
+    this->declare_parameter<double>("recover_speed", 0.7);  // Increased from 0.4 for faster backup
+    recover_speed_ = this->get_parameter("recover_speed").as_double();
+    
+    // Ball detection parameters
+    this->declare_parameter<double>("min_ball_radius", 15.0);
+    min_ball_radius_ = this->get_parameter("min_ball_radius").as_double();
+    
+    this->declare_parameter<double>("max_ball_radius", 160.0);
+    max_ball_radius_ = this->get_parameter("max_ball_radius").as_double();
+    
+    this->declare_parameter<double>("collection_cooldown", 1.0);
+    collection_cooldown_ = this->get_parameter("collection_cooldown").as_double();
+    
+    this->declare_parameter<double>("target_lost_timeout", 3.0);
+    target_lost_timeout_ = this->get_parameter("target_lost_timeout").as_double();
+    
+    // Camera parameters for distance estimation
+    this->declare_parameter<double>("camera_fov_horizontal", 1.3962634);  // 80 degrees
+    camera_fov_horizontal_ = this->get_parameter("camera_fov_horizontal").as_double();
+    
+    this->declare_parameter<double>("camera_resolution_width", 640.0);
+    camera_resolution_width_ = this->get_parameter("camera_resolution_width").as_double();
+    
+    this->declare_parameter<double>("ball_actual_diameter", 0.15);  // 15cm ball
+    ball_actual_diameter_ = this->get_parameter("ball_actual_diameter").as_double();
+    
+    // Focal length = (image_width / 2) / tan(fov/2)
+    camera_focal_length_ = (camera_resolution_width_ / 2.0) / std::tan(camera_fov_horizontal_ / 2.0);
+    
+    // Exploration parameters
+    this->declare_parameter<double>("exploration_waypoint_distance", 1.5);  // Reduced from 2.0 for closer waypoints
+    exploration_waypoint_distance_ = this->get_parameter("exploration_waypoint_distance").as_double();
+    
+    this->declare_parameter<double>("exploration_timeout", 15.0);  // Reduced from 30.0 for faster waypoint switching
+    exploration_timeout_ = this->get_parameter("exploration_timeout").as_double();
+
+    // -------------------------------------------------------------------------
+    // Initialize target ball
+    // -------------------------------------------------------------------------
+    target_ball_.valid = false;
+    target_ball_.position_known = false;
+    last_collection_time_ = this->now() - rclcpp::Duration::from_seconds(10.0);
+
+    // -------------------------------------------------------------------------
+    // Initialize TF2
+    // -------------------------------------------------------------------------
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    // -------------------------------------------------------------------------
+    // Initialize random number generator
+    // -------------------------------------------------------------------------
+    std::random_device rd;
+    rng_ = std::mt19937(rd());
+
+    // -------------------------------------------------------------------------
+    // Initialize timing
+    // -------------------------------------------------------------------------
+    last_progress_time_ = this->now();
+    recover_start_time_ = this->now();
+    exploration_start_time_ = this->now();
+    last_goal_rejection_time_ = this->now() - rclcpp::Duration::from_seconds(60.0);  // Allow goals immediately
+    
+    // -------------------------------------------------------------------------
+    // Initialize corner escape state
+    // -------------------------------------------------------------------------
+    in_corner_escape_ = false;
+    corner_escape_start_time_ = this->now();
+    escape_target_angle_ = 0.0f;
+    escape_phase_ = 0;
+    last_escape_x_ = 0.0;
+    last_escape_y_ = 0.0;
+    consecutive_stuck_count_ = 0;
+    same_direction_attempts_ = 0;
+    last_escape_direction_ = 0.0f;
+    blocked_directions_.clear();
+    blocked_directions_clear_time_ = this->now();
+
+    // -------------------------------------------------------------------------
+    // Create ROS 2 communication
+    // -------------------------------------------------------------------------
+    
+    // Subscribers
+    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+        scan_topic_,
+        rclcpp::SensorDataQoS(),
+        std::bind(&NavBallCollectorNode::scan_callback, this, std::placeholders::_1));
+    
+    detection_sub_ = this->create_subscription<ballvac_msgs::msg::BallDetectionArray>(
+        detection_topic_,
+        10,
+        std::bind(&NavBallCollectorNode::detection_callback, this, std::placeholders::_1));
+    
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic_,
+        10,
+        std::bind(&NavBallCollectorNode::odom_callback, this, std::placeholders::_1));
+    
+    // Publishers
+    cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_topic_, 10);
+    
+    // Action client for Nav2 NavigateToPose
+    nav_to_pose_client_ = rclcpp_action::create_client<NavigateToPose>(
+        this, "navigate_to_pose");
+    
+    // Service clients
+    delete_client_ = this->create_client<ros_gz_interfaces::srv::DeleteEntity>(delete_service_);
+    spawn_client_ = this->create_client<ros_gz_interfaces::srv::SpawnEntity>(spawn_service_);
+
+    // -------------------------------------------------------------------------
+    // Create control loop timer
+    // -------------------------------------------------------------------------
+    auto control_period = std::chrono::duration<double>(1.0 / control_rate_);
+    control_timer_ = this->create_wall_timer(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(control_period),
+        std::bind(&NavBallCollectorNode::control_loop, this));
+
+    // -------------------------------------------------------------------------
+    // Log startup information
+    // -------------------------------------------------------------------------
+    RCLCPP_INFO(this->get_logger(), "========================================");
+    RCLCPP_INFO(this->get_logger(), "Nav Ball Collector Node Started");
+    RCLCPP_INFO(this->get_logger(), "========================================");
+    RCLCPP_INFO(this->get_logger(), "Using Nav2 for path planning!");
+    RCLCPP_INFO(this->get_logger(), "Topics:");
+    RCLCPP_INFO(this->get_logger(), "  Scan: %s", scan_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "  Detections: %s", detection_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "  Odom: %s", odom_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Frames:");
+    RCLCPP_INFO(this->get_logger(), "  Map: %s", map_frame_.c_str());
+    RCLCPP_INFO(this->get_logger(), "  Robot: %s", robot_frame_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Parameters:");
+    RCLCPP_INFO(this->get_logger(), "  Nav to approach dist: %.2f m", nav_to_approach_distance_);
+    RCLCPP_INFO(this->get_logger(), "  Collect distance: %.2f m", collect_distance_m_);
+    RCLCPP_INFO(this->get_logger(), "  Camera focal length: %.2f px", camera_focal_length_);
+    RCLCPP_INFO(this->get_logger(), "========================================");
+}
+
+// =============================================================================
+// Callbacks
+// =============================================================================
+
+void NavBallCollectorNode::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+{
+    latest_scan_ = msg;
+}
+
+void NavBallCollectorNode::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    latest_odom_ = msg;
+    
+    // Update current pose
+    current_pose_.header = msg->header;
+    current_pose_.header.frame_id = map_frame_;  // We'll transform if needed
+    current_pose_.pose = msg->pose.pose;
+    pose_received_ = true;
+}
+
+void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetectionArray::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    // Skip if no detections
+    if (msg->detections.empty())
+    {
+        return;
+    }
+    
+    // Check cooldown
+    double time_since_collection = (this->now() - last_collection_time_).seconds();
+    if (time_since_collection < collection_cooldown_)
+    {
+        return;
+    }
+    
+    // In IDLE or EXPLORING state, look for balls to approach
+    if (current_state_ == NavCollectorState::IDLE || 
+        current_state_ == NavCollectorState::EXPLORING)
+    {
+        // Find the best ball (largest apparent size within valid range)
+        const ballvac_msgs::msg::BallDetection * best_ball = nullptr;
+        float best_size = 0.0f;
+        
+        for (const auto & det : msg->detections)
+        {
+            // Filter by radius
+            if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
+            {
+                continue;
+            }
+            
+            // Skip already collected balls
+            if (collected_balls_.count(det.name) > 0)
+            {
+                continue;
+            }
+            
+            if (det.apparent_size > best_size)
+            {
+                best_size = det.apparent_size;
+                best_ball = &det;
+            }
+        }
+        
+        if (best_ball != nullptr)
+        {
+            // Found a ball! Set as target
+            target_ball_.valid = true;
+            target_ball_.name = best_ball->name;
+            target_ball_.color = best_ball->color;
+            target_ball_.bearing = best_ball->bearing;
+            target_ball_.apparent_size = best_ball->apparent_size;
+            target_ball_.last_seen = this->now();
+            
+            // Estimate world position
+            target_ball_.world_pose = estimate_ball_world_pose(*best_ball);
+            target_ball_.position_known = true;
+            target_ball_.estimated_distance = estimate_distance_from_size(best_ball->apparent_size);
+            
+            RCLCPP_INFO(this->get_logger(), 
+                "Detected ball: '%s' (bearing=%.2f, size=%.1f, est_dist=%.2fm)",
+                best_ball->name.c_str(), best_ball->bearing, best_ball->apparent_size,
+                target_ball_.estimated_distance);
+            
+            // Cancel any ongoing exploration and start navigation
+            if (navigation_in_progress_)
+            {
+                cancel_navigation();
+            }
+            
+            transition_to(NavCollectorState::NAVIGATING);
+        }
+    }
+    // In NAVIGATING or APPROACHING state, update target tracking
+    else if (current_state_ == NavCollectorState::NAVIGATING || 
+             current_state_ == NavCollectorState::APPROACHING)
+    {
+        if (!target_ball_.valid)
+        {
+            return;
+        }
+        
+        // Look for our target ball
+        for (const auto & det : msg->detections)
+        {
+            if (det.color == target_ball_.color)
+            {
+                // Filter by radius
+                if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
+                {
+                    continue;
+                }
+                
+                // Update target info
+                target_ball_.bearing = det.bearing;
+                target_ball_.apparent_size = det.apparent_size;
+                target_ball_.last_seen = this->now();
+                target_ball_.estimated_distance = estimate_distance_from_size(det.apparent_size);
+                
+                // Update world pose
+                target_ball_.world_pose = estimate_ball_world_pose(det);
+                
+                RCLCPP_DEBUG(this->get_logger(), 
+                    "Tracking '%s': bearing=%.2f, size=%.1f, dist=%.2fm",
+                    det.name.c_str(), det.bearing, det.apparent_size,
+                    target_ball_.estimated_distance);
+                
+                // Check if close enough to switch to APPROACHING
+                if (current_state_ == NavCollectorState::NAVIGATING &&
+                    target_ball_.estimated_distance < nav_to_approach_distance_)
+                {
+                    RCLCPP_INFO(this->get_logger(), 
+                        "Ball within %.2fm - switching to reactive approach",
+                        target_ball_.estimated_distance);
+                    cancel_navigation();
+                    transition_to(NavCollectorState::APPROACHING);
+                }
+                
+                // Check if close enough to collect
+                if (det.apparent_size > approach_radius_threshold_)
+                {
+                    RCLCPP_INFO(this->get_logger(), 
+                        "Ball '%s' radius %.1f > threshold %.1f - COLLECTING",
+                        target_ball_.name.c_str(), det.apparent_size, approach_radius_threshold_);
+                    cancel_navigation();
+                    transition_to(NavCollectorState::COLLECTING);
+                }
+                
+                break;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Main control loop
+// =============================================================================
+
+void NavBallCollectorNode::control_loop()
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    switch (current_state_)
+    {
+        case NavCollectorState::IDLE:
+            execute_idle();
+            break;
+        case NavCollectorState::EXPLORING:
+            execute_exploring();
+            break;
+        case NavCollectorState::NAVIGATING:
+            execute_navigating();
+            break;
+        case NavCollectorState::APPROACHING:
+            execute_approaching();
+            break;
+        case NavCollectorState::COLLECTING:
+            execute_collecting();
+            break;
+        case NavCollectorState::RECOVERING:
+            execute_recovering();
+            break;
+    }
+}
+
+// =============================================================================
+// IDLE state - Wait for system ready
+// =============================================================================
+
+void NavBallCollectorNode::execute_idle()
+{
+    // Wait for necessary data
+    if (!latest_scan_)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "IDLE: Waiting for LiDAR data...");
+        return;
+    }
+    
+    if (!pose_received_)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "IDLE: Waiting for odometry data...");
+        return;
+    }
+    
+    // Check if Nav2 is available
+    if (!nav_to_pose_client_->wait_for_action_server(std::chrono::milliseconds(100)))
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "IDLE: Waiting for Nav2 action server...");
+        return;
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "System ready! Starting exploration...");
+    transition_to(NavCollectorState::EXPLORING);
+}
+
+// =============================================================================
+// EXPLORING state - FAST LiDAR-based exploration with corner escape
+// =============================================================================
+
+void NavBallCollectorNode::execute_exploring()
+{
+    // PRIORITY 1: If in corner escape mode, handle it first
+    if (in_corner_escape_)
+    {
+        if (execute_lidar_escape())
+        {
+            // Escape complete
+            in_corner_escape_ = false;
+            consecutive_stuck_count_ = 0;
+            RCLCPP_INFO(this->get_logger(), "EXPLORING: Corner escape complete!");
+        }
+        return;
+    }
+    
+    // PRIORITY 2: Check if stuck in corner
+    if (is_stuck() || detect_corner_situation())
+    {
+        consecutive_stuck_count_++;
+        
+        if (consecutive_stuck_count_ >= 2)
+        {
+            RCLCPP_WARN(this->get_logger(), 
+                "EXPLORING: Corner/stuck detected! Starting LiDAR escape...");
+            in_corner_escape_ = true;
+            corner_escape_start_time_ = this->now();
+            escape_phase_ = 0;
+            
+            // Find escape direction
+            float escape_angle, escape_dist;
+            if (find_escape_direction(escape_angle, escape_dist))
+            {
+                escape_target_angle_ = escape_angle;
+                RCLCPP_INFO(this->get_logger(), 
+                    "Escape direction found: angle=%.2f rad (%.1f deg), dist=%.2fm",
+                    escape_angle, escape_angle * 180.0 / M_PI, escape_dist);
+            }
+            else
+            {
+                // No clear direction - just turn around
+                escape_target_angle_ = M_PI;
+                RCLCPP_WARN(this->get_logger(), "No clear escape - turning around");
+            }
+            return;
+        }
+    }
+    else
+    {
+        consecutive_stuck_count_ = 0;
+    }
+    
+    // ===========================================================================
+    // FAST LiDAR-BASED EXPLORATION - Always go FORWARD, avoid by steering!
+    // ===========================================================================
+    
+    float min_front, min_left, min_right;
+    check_obstacle_sectors(min_front, min_left, min_right);
+    
+    float linear_vel = approach_speed_ * 1.5;  // Fast exploration - always forward!
+    float angular_vel = 0.0;
+    
+    // ALWAYS TRY TO GO FORWARD - just steer around obstacles!
+    
+    if (min_front < obstacle_stop_m_ * 0.5)
+    {
+        // VERY CLOSE - slow down and turn sharply, but still go forward if possible
+        if (min_left > min_right && min_left > obstacle_stop_m_)
+        {
+            // Left is clear - turn left while moving forward
+            linear_vel = approach_speed_ * 0.4;
+            angular_vel = max_steer_ * 2.0;
+        }
+        else if (min_right > obstacle_stop_m_)
+        {
+            // Right is clear - turn right while moving forward
+            linear_vel = approach_speed_ * 0.4;
+            angular_vel = -max_steer_ * 2.0;
+        }
+        else
+        {
+            // Both sides blocked - very slow with maximum turn
+            linear_vel = approach_speed_ * 0.2;
+            angular_vel = (min_left > min_right) ? max_steer_ * 2.0 : -max_steer_ * 2.0;
+        }
+    }
+    else if (min_front < obstacle_stop_m_)
+    {
+        // Close obstacle - turn away while still moving forward
+        linear_vel = approach_speed_ * 0.5;
+        
+        if (min_left > min_right)
+        {
+            angular_vel = max_steer_ * 1.5;
+        }
+        else
+        {
+            angular_vel = -max_steer_ * 1.5;
+        }
+    }
+    else if (min_front < obstacle_slow_m_)
+    {
+        // Moderate distance - steer away proportionally
+        float steer_factor = 1.0f - (min_front / obstacle_slow_m_);
+        linear_vel = approach_speed_ * (0.6f + 0.4f * (min_front / obstacle_slow_m_));
+        
+        if (min_left > min_right)
+        {
+            angular_vel = max_steer_ * steer_factor * 1.2f;
+        }
+        else
+        {
+            angular_vel = -max_steer_ * steer_factor * 1.2f;
+        }
+    }
+    else if (min_front < obstacle_avoid_m_)
+    {
+        // Far obstacle - slight steering
+        linear_vel = approach_speed_ * 1.2;
+        
+        if (min_left > min_right && min_right < 2.0)
+        {
+            angular_vel = max_steer_ * 0.4f;
+        }
+        else if (min_right > min_left && min_left < 2.0)
+        {
+            angular_vel = -max_steer_ * 0.4f;
+        }
+        
+        linear_vel = approach_speed_ * 0.8;
+    }
+    else
+    {
+        // OPEN SPACE - add wandering behavior
+        static double wander_timer = 0.0;
+        wander_timer += 0.05;  // 20Hz
+        
+        // Sinusoidal wandering for exploration coverage
+        angular_vel = std::sin(wander_timer * 0.3) * max_steer_ * 0.3;
+    }
+    
+    // Update progress tracking
+    if (latest_odom_)
+    {
+        double dx = latest_odom_->pose.pose.position.x - last_escape_x_;
+        double dy = latest_odom_->pose.pose.position.y - last_escape_y_;
+        double dist_moved = std::sqrt(dx*dx + dy*dy);
+        
+        if (dist_moved > 0.5)
+        {
+            last_escape_x_ = latest_odom_->pose.pose.position.x;
+            last_escape_y_ = latest_odom_->pose.pose.position.y;
+            last_progress_time_ = this->now();
+        }
+    }
+    
+    publish_cmd_vel(linear_vel, angular_vel);
+}
+
+// =============================================================================
+// NAVIGATING state - Navigate to ball using Nav2
+// =============================================================================
+
+void NavBallCollectorNode::execute_navigating()
+{
+    if (!target_ball_.valid)
+    {
+        RCLCPP_WARN(this->get_logger(), "NAVIGATING: No valid target, returning to explore");
+        transition_to(NavCollectorState::EXPLORING);
+        return;
+    }
+    
+    // Check if target was lost
+    double time_since_seen = (this->now() - target_ball_.last_seen).seconds();
+    if (time_since_seen > target_lost_timeout_)
+    {
+        RCLCPP_WARN(this->get_logger(), 
+            "NAVIGATING: Target '%s' lost for %.1f seconds",
+            target_ball_.name.c_str(), time_since_seen);
+        target_ball_.valid = false;
+        cancel_navigation();
+        transition_to(NavCollectorState::EXPLORING);
+        return;
+    }
+    
+    // If navigation is not in progress, send goal to ball position
+    if (!navigation_in_progress_ && target_ball_.position_known)
+    {
+        // Create goal slightly in front of ball (so we don't collide)
+        geometry_msgs::msg::PoseStamped goal = target_ball_.world_pose;
+        
+        // Offset goal back from ball towards robot
+        if (latest_odom_)
+        {
+            double dx = goal.pose.position.x - latest_odom_->pose.pose.position.x;
+            double dy = goal.pose.position.y - latest_odom_->pose.pose.position.y;
+            double dist = std::sqrt(dx*dx + dy*dy);
+            
+            if (dist > 0.1)
+            {
+                // Place goal nav_to_approach_distance_ away from ball
+                double offset = std::min(nav_to_approach_distance_, dist * 0.7);
+                goal.pose.position.x -= offset * (dx / dist);
+                goal.pose.position.y -= offset * (dy / dist);
+                
+                // Face towards the ball
+                double yaw = std::atan2(dy, dx);
+                goal.pose.orientation.z = std::sin(yaw / 2.0);
+                goal.pose.orientation.w = std::cos(yaw / 2.0);
+            }
+        }
+        
+        if (send_navigation_goal(goal))
+        {
+            RCLCPP_INFO(this->get_logger(), 
+                "NAVIGATING: Sent goal near ball at (%.2f, %.2f)",
+                goal.pose.position.x, goal.pose.position.y);
+        }
+    }
+    
+    // If navigation succeeded or we're close enough, switch to approaching
+    if (navigation_succeeded_)
+    {
+        RCLCPP_INFO(this->get_logger(), "NAVIGATING: Goal reached, switching to APPROACHING");
+        navigation_succeeded_ = false;
+        transition_to(NavCollectorState::APPROACHING);
+    }
+}
+
+// =============================================================================
+// APPROACHING state - Reactive approach to ball
+// =============================================================================
+
+void NavBallCollectorNode::execute_approaching()
+{
+    if (!target_ball_.valid)
+    {
+        RCLCPP_WARN(this->get_logger(), "APPROACHING: No valid target, returning to EXPLORING");
+        transition_to(NavCollectorState::EXPLORING);
+        return;
+    }
+    
+    // Check if target was lost
+    double time_since_seen = (this->now() - target_ball_.last_seen).seconds();
+    if (time_since_seen > target_lost_timeout_)
+    {
+        RCLCPP_WARN(this->get_logger(), 
+            "APPROACHING: Target '%s' lost for %.1f seconds, returning to EXPLORING",
+            target_ball_.name.c_str(), time_since_seen);
+        target_ball_.valid = false;
+        transition_to(NavCollectorState::EXPLORING);
+        return;
+    }
+    
+    // Get LIDAR-based obstacle information
+    float min_front_range = std::numeric_limits<float>::max();
+    float min_left_range = std::numeric_limits<float>::max();
+    float min_right_range = std::numeric_limits<float>::max();
+    check_obstacle_sectors(min_front_range, min_left_range, min_right_range);
+    
+    float linear_vel = approach_speed_;
+    float angular_vel = 0.0;
+    
+    // =========================================================================
+    // KEY CHANGE: When we see the ball, IGNORE obstacles and go straight to it!
+    // The ball itself appears as an obstacle in LiDAR - that's what we want!
+    // =========================================================================
+    
+    // Check if ball is large enough (close enough) to collect
+    if (target_ball_.apparent_size > approach_radius_threshold_ * 0.8)
+    {
+        RCLCPP_INFO(this->get_logger(), 
+            "APPROACHING: Ball size %.1f > threshold, transitioning to COLLECTING",
+            target_ball_.apparent_size);
+        transition_to(NavCollectorState::COLLECTING);
+        return;
+    }
+    
+    // If something is very close in front AND we're looking at the ball, it's probably the ball!
+    if (min_front_range < collect_distance_m_ + 0.2 && std::abs(target_ball_.bearing) < 0.5)
+    {
+        RCLCPP_INFO(this->get_logger(), 
+            "APPROACHING: Close object (%.2fm) in ball direction - COLLECTING!",
+            min_front_range);
+        transition_to(NavCollectorState::COLLECTING);
+        return;
+    }
+    
+    // =========================================================================
+    // Simple approach: Just drive towards the ball, ignore obstacles!
+    // The ball is what we want to hit anyway.
+    // =========================================================================
+    
+    // Proportional steering towards ball
+    angular_vel = -steering_gain_ * target_ball_.bearing;
+    angular_vel = std::clamp(angular_vel, static_cast<float>(-max_steer_), 
+                             static_cast<float>(max_steer_));
+    
+    // Speed based on how centered the ball is
+    if (std::abs(target_ball_.bearing) > 0.5)
+    {
+        // Ball is to the side - slow down and turn more
+        linear_vel = approach_speed_ * 0.5;
+        angular_vel *= 1.5;
+    }
+    else
+    {
+        // Ball is ahead - full speed!
+        linear_vel = approach_speed_;
+    }
+    
+    // Clamp angular velocity
+    angular_vel = std::clamp(angular_vel, static_cast<float>(-max_steer_), static_cast<float>(max_steer_));
+    
+    RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "APPROACHING: bearing=%.2f, vel=(%.2f, %.2f), front_range=%.2f",
+        target_ball_.bearing, linear_vel, angular_vel, min_front_range);
+    
+    publish_cmd_vel(linear_vel, angular_vel);
+}
+
+// =============================================================================
+// COLLECTING state - Delete the ball entity
+// =============================================================================
+
+void NavBallCollectorNode::execute_collecting()
+{
+    if (!target_ball_.valid)
+    {
+        RCLCPP_WARN(this->get_logger(), "COLLECTING: No valid target");
+        transition_to(NavCollectorState::EXPLORING);
+        return;
+    }
+    
+    // Stop the robot
+    publish_cmd_vel(0.0, 0.0);
+    
+    // Delete the ball if not already pending
+    if (!delete_pending_)
+    {
+        RCLCPP_INFO(this->get_logger(), 
+            "COLLECTING: Attempting to delete ball '%s'", target_ball_.name.c_str());
+        delete_entity(target_ball_.name);
+        delete_pending_ = true;
+    }
+}
+
+// =============================================================================
+// RECOVERING state - LiDAR-based smart recovery
+// =============================================================================
+
+void NavBallCollectorNode::execute_recovering()
+{
+    double elapsed = (this->now() - recover_start_time_).seconds();
+    
+    // Find escape direction if not set
+    if (recover_phase_ == 0)
+    {
+        float escape_angle, escape_dist;
+        if (find_escape_direction(escape_angle, escape_dist))
+        {
+            escape_target_angle_ = escape_angle;
+            
+            // Determine turn direction based on escape angle
+            if (escape_angle > 0)
+            {
+                recover_turn_direction_ = 1.0f;  // Turn left
+            }
+            else
+            {
+                recover_turn_direction_ = -1.0f;  // Turn right
+            }
+        }
+        else
+        {
+            // Default: turn towards more open side
+            float min_front, min_left, min_right;
+            check_obstacle_sectors(min_front, min_left, min_right);
+            recover_turn_direction_ = (min_left > min_right) ? 1.0f : -1.0f;
+            escape_target_angle_ = recover_turn_direction_ * M_PI / 2;
+        }
+        recover_phase_ = 1;
+    }
+    
+    if (elapsed < recover_duration_ * 0.4)
+    {
+        // Phase 1: Back up quickly
+        publish_cmd_vel(-recover_speed_ * 1.5, 0.0);
+    }
+    else if (elapsed < recover_duration_ * 0.8)
+    {
+        // Phase 2: Turn aggressively towards escape direction
+        float turn_intensity = std::min(static_cast<float>(std::abs(escape_target_angle_) / M_PI), 1.0f);
+        publish_cmd_vel(-recover_speed_ * 0.3, 
+                       recover_turn_direction_ * max_steer_ * (1.5 + turn_intensity));
+    }
+    else if (elapsed < recover_duration_)
+    {
+        // Phase 3: Short forward burst in new direction
+        float min_front, min_left, min_right;
+        check_obstacle_sectors(min_front, min_left, min_right);
+        
+        if (min_front > obstacle_stop_m_)
+        {
+            publish_cmd_vel(approach_speed_ * 0.5, recover_turn_direction_ * max_steer_ * 0.3);
+        }
+        else
+        {
+            // Still blocked - continue turning
+            publish_cmd_vel(0.0, recover_turn_direction_ * max_steer_ * 2.0);
+        }
+    }
+    else
+    {
+        // Recovery complete
+        RCLCPP_INFO(this->get_logger(), "RECOVERING: Complete, returning to EXPLORING");
+        transition_to(NavCollectorState::EXPLORING);
+    }
+}
+
+// =============================================================================
+// State transition
+// =============================================================================
+
+void NavBallCollectorNode::transition_to(NavCollectorState new_state)
+{
+    if (new_state == current_state_)
+    {
+        return;
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "State transition: %s -> %s",
+        nav_state_to_string(current_state_).c_str(),
+        nav_state_to_string(new_state).c_str());
+    
+    // Exit actions
+    switch (current_state_)
+    {
+        case NavCollectorState::NAVIGATING:
+        case NavCollectorState::EXPLORING:
+            if (navigation_in_progress_)
+            {
+                cancel_navigation();
+            }
+            break;
+        default:
+            break;
+    }
+    
+    // Entry actions
+    switch (new_state)
+    {
+        case NavCollectorState::RECOVERING:
+            recover_start_time_ = this->now();
+            recover_phase_ = 0;
+            break;
+        case NavCollectorState::EXPLORING:
+            navigation_in_progress_ = false;
+            break;
+        case NavCollectorState::NAVIGATING:
+            navigation_in_progress_ = false;
+            navigation_succeeded_ = false;
+            break;
+        default:
+            break;
+    }
+    
+    current_state_ = new_state;
+    last_progress_time_ = this->now();
+}
+
+// =============================================================================
+// Navigation functions
+// =============================================================================
+
+bool NavBallCollectorNode::send_navigation_goal(const geometry_msgs::msg::PoseStamped & goal_pose)
+{
+    // Check if we're in a rejection cooldown period
+    double rejection_cooldown = std::min(2.0 + consecutive_rejections_ * 0.5, 10.0);  // 2-10 seconds
+    double time_since_rejection = (this->now() - last_goal_rejection_time_).seconds();
+    if (consecutive_rejections_ > 0 && time_since_rejection < rejection_cooldown)
+    {
+        RCLCPP_DEBUG(this->get_logger(), 
+            "In goal rejection cooldown (%.1fs remaining)",
+            rejection_cooldown - time_since_rejection);
+        return false;
+    }
+    
+    if (!nav_to_pose_client_->wait_for_action_server(std::chrono::milliseconds(100)))
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "IDLE: Waiting for Nav2 action server...");
+        return false;
+    }
+    
+    auto goal_msg = NavigateToPose::Goal();
+    goal_msg.pose = goal_pose;
+    goal_msg.pose.header.stamp = this->now();
+    goal_msg.pose.header.frame_id = map_frame_;
+    
+    auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+    send_goal_options.goal_response_callback =
+        std::bind(&NavBallCollectorNode::navigate_goal_response_callback, this, std::placeholders::_1);
+    send_goal_options.feedback_callback =
+        std::bind(&NavBallCollectorNode::navigate_feedback_callback, this, 
+            std::placeholders::_1, std::placeholders::_2);
+    send_goal_options.result_callback =
+        std::bind(&NavBallCollectorNode::navigate_result_callback, this, std::placeholders::_1);
+    
+    // Mark as in progress immediately to prevent multiple goals
+    navigation_in_progress_ = true;
+    
+    nav_to_pose_client_->async_send_goal(goal_msg, send_goal_options);
+    current_nav_goal_ = goal_pose;
+    
+    return true;
+}
+
+void NavBallCollectorNode::cancel_navigation()
+{
+    if (navigation_in_progress_ && current_goal_handle_)
+    {
+        RCLCPP_INFO(this->get_logger(), "Cancelling navigation");
+        nav_to_pose_client_->async_cancel_goal(current_goal_handle_);
+    }
+    navigation_in_progress_ = false;
+    current_goal_handle_ = nullptr;
+}
+
+void NavBallCollectorNode::navigate_goal_response_callback(
+    const GoalHandleNavigateToPose::SharedPtr & goal_handle)
+{
+    if (!goal_handle)
+    {
+        RCLCPP_WARN(this->get_logger(), "Navigation goal was rejected");
+        navigation_in_progress_ = false;
+        last_goal_rejection_time_ = this->now();
+        consecutive_rejections_++;
+        
+        // Log if many rejections (Nav2 not ready)
+        if (consecutive_rejections_ >= 5)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Nav2 appears not ready - %d consecutive rejections. Waiting...",
+                consecutive_rejections_);
+        }
+    }
+    else
+    {
+        RCLCPP_DEBUG(this->get_logger(), "Navigation goal accepted");
+        navigation_in_progress_ = true;
+        current_goal_handle_ = goal_handle;
+        consecutive_rejections_ = 0;  // Reset on success
+    }
+}
+
+void NavBallCollectorNode::navigate_feedback_callback(
+    GoalHandleNavigateToPose::SharedPtr,
+    const std::shared_ptr<const NavigateToPose::Feedback> feedback)
+{
+    RCLCPP_DEBUG(this->get_logger(), 
+        "Nav feedback: distance remaining = %.2f m",
+        feedback->distance_remaining);
+}
+
+void NavBallCollectorNode::navigate_result_callback(
+    const GoalHandleNavigateToPose::WrappedResult & result)
+{
+    navigation_in_progress_ = false;
+    current_goal_handle_ = nullptr;
+    
+    switch (result.code)
+    {
+        case rclcpp_action::ResultCode::SUCCEEDED:
+            RCLCPP_INFO(this->get_logger(), "Navigation succeeded!");
+            navigation_succeeded_ = true;
+            break;
+        case rclcpp_action::ResultCode::ABORTED:
+            RCLCPP_WARN(this->get_logger(), "Navigation was aborted");
+            break;
+        case rclcpp_action::ResultCode::CANCELED:
+            RCLCPP_INFO(this->get_logger(), "Navigation was canceled");
+            break;
+        default:
+            RCLCPP_WARN(this->get_logger(), "Navigation returned unknown result");
+            break;
+    }
+}
+
+geometry_msgs::msg::PoseStamped NavBallCollectorNode::generate_exploration_goal()
+{
+    geometry_msgs::msg::PoseStamped goal;
+    goal.header.frame_id = map_frame_;
+    goal.header.stamp = this->now();
+    
+    // Generate random waypoint in front of robot
+    if (latest_odom_)
+    {
+        double current_x = latest_odom_->pose.pose.position.x;
+        double current_y = latest_odom_->pose.pose.position.y;
+        
+        // Get current yaw
+        double qz = latest_odom_->pose.pose.orientation.z;
+        double qw = latest_odom_->pose.pose.orientation.w;
+        double current_yaw = 2.0 * std::atan2(qz, qw);
+        
+        // Generate random offset
+        std::uniform_real_distribution<double> angle_dist(-M_PI/3, M_PI/3);
+        std::uniform_real_distribution<double> dist_dist(1.5, exploration_waypoint_distance_);
+        
+        double angle_offset = angle_dist(rng_);
+        double distance = dist_dist(rng_);
+        
+        double goal_yaw = current_yaw + angle_offset;
+        goal.pose.position.x = current_x + distance * std::cos(goal_yaw);
+        goal.pose.position.y = current_y + distance * std::sin(goal_yaw);
+        goal.pose.position.z = 0.0;
+        
+        goal.pose.orientation.z = std::sin(goal_yaw / 2.0);
+        goal.pose.orientation.w = std::cos(goal_yaw / 2.0);
+    }
+    else
+    {
+        // Default if no odometry
+        goal.pose.position.x = 1.0;
+        goal.pose.position.y = 0.0;
+        goal.pose.orientation.w = 1.0;
+    }
+    
+    exploration_waypoint_index_++;
+    return goal;
+}
+
+geometry_msgs::msg::PoseStamped NavBallCollectorNode::estimate_ball_world_pose(
+    const ballvac_msgs::msg::BallDetection & detection)
+{
+    geometry_msgs::msg::PoseStamped world_pose;
+    world_pose.header.frame_id = map_frame_;
+    world_pose.header.stamp = this->now();
+    
+    // Estimate distance from apparent size
+    double distance = estimate_distance_from_size(detection.apparent_size);
+    
+    // Ball bearing is angle from camera center
+    double bearing = detection.bearing;
+    
+    // Calculate position relative to robot
+    if (latest_odom_)
+    {
+        double robot_x = latest_odom_->pose.pose.position.x;
+        double robot_y = latest_odom_->pose.pose.position.y;
+        
+        // Get robot yaw
+        double qz = latest_odom_->pose.pose.orientation.z;
+        double qw = latest_odom_->pose.pose.orientation.w;
+        double robot_yaw = 2.0 * std::atan2(qz, qw);
+        
+        // Ball angle in world frame
+        double ball_angle = robot_yaw - bearing;  // Negative because bearing is positive to right
+        
+        // Ball position in world frame
+        world_pose.pose.position.x = robot_x + distance * std::cos(ball_angle);
+        world_pose.pose.position.y = robot_y + distance * std::sin(ball_angle);
+        world_pose.pose.position.z = 0.0;
+        world_pose.pose.orientation.w = 1.0;
+    }
+    
+    return world_pose;
+}
+
+double NavBallCollectorNode::estimate_distance_from_size(double apparent_size)
+{
+    // Using pinhole camera model:
+    // apparent_size (pixels) = focal_length * actual_diameter / distance
+    // distance = focal_length * actual_diameter / apparent_size
+    
+    if (apparent_size < 1.0)
+    {
+        return 10.0;  // Very far
+    }
+    
+    double distance = (camera_focal_length_ * ball_actual_diameter_) / apparent_size;
+    
+    // Clamp to reasonable range
+    return std::clamp(distance, 0.3, 15.0);
+}
+
+bool NavBallCollectorNode::transform_pose(
+    const geometry_msgs::msg::PoseStamped & input,
+    geometry_msgs::msg::PoseStamped & output,
+    const std::string & target_frame)
+{
+    try
+    {
+        output = tf_buffer_->transform(input, target_frame, tf2::durationFromSec(0.5));
+        return true;
+    }
+    catch (tf2::TransformException & ex)
+    {
+        RCLCPP_WARN(this->get_logger(), "Transform failed: %s", ex.what());
+        return false;
+    }
+}
+
+// =============================================================================
+// Helper functions
+// =============================================================================
+
+bool NavBallCollectorNode::check_obstacle_front(float & min_range)
+{
+    float min_left, min_right;
+    check_obstacle_sectors(min_range, min_left, min_right);
+    return min_range < obstacle_stop_m_;
+}
+
+void NavBallCollectorNode::check_obstacle_sectors(float & min_front, float & min_left, float & min_right)
+{
+    min_front = 10.0f;
+    min_left = 10.0f;
+    min_right = 10.0f;
+    
+    if (!latest_scan_)
+    {
+        return;
+    }
+    
+    size_t num_readings = latest_scan_->ranges.size();
+    if (num_readings == 0)
+    {
+        return;
+    }
+    
+    float angle_min = latest_scan_->angle_min;
+    float angle_increment = latest_scan_->angle_increment;
+    
+    auto angle_to_index = [&](float angle) -> size_t {
+        angle = std::clamp(angle, angle_min, latest_scan_->angle_max);
+        int idx = static_cast<int>((angle - angle_min) / angle_increment);
+        return static_cast<size_t>(std::clamp(idx, 0, static_cast<int>(num_readings - 1)));
+    };
+    
+    // Front sector: -40° to +40° (wider for better detection)
+    size_t front_start = angle_to_index(-0.7f);
+    size_t front_end = angle_to_index(0.7f);
+    
+    // Left sector: +20° to +90°
+    size_t left_start = angle_to_index(0.35f);
+    size_t left_end = angle_to_index(1.57f);
+    
+    // Right sector: -90° to -20°
+    size_t right_start = angle_to_index(-1.57f);
+    size_t right_end = angle_to_index(-0.35f);
+    
+    for (size_t i = front_start; i <= front_end && i < num_readings; ++i)
+    {
+        if (std::isfinite(latest_scan_->ranges[i]) && latest_scan_->ranges[i] > 0.1f)
+        {
+            min_front = std::min(min_front, latest_scan_->ranges[i]);
+        }
+    }
+    
+    for (size_t i = left_start; i <= left_end && i < num_readings; ++i)
+    {
+        if (std::isfinite(latest_scan_->ranges[i]) && latest_scan_->ranges[i] > 0.1f)
+        {
+            min_left = std::min(min_left, latest_scan_->ranges[i]);
+        }
+    }
+    
+    for (size_t i = right_start; i <= right_end && i < num_readings; ++i)
+    {
+        if (std::isfinite(latest_scan_->ranges[i]) && latest_scan_->ranges[i] > 0.1f)
+        {
+            min_right = std::min(min_right, latest_scan_->ranges[i]);
+        }
+    }
+}
+
+float NavBallCollectorNode::compute_obstacle_avoidance_steering()
+{
+    if (!latest_scan_)
+    {
+        return 0.0f;
+    }
+    
+    size_t num_readings = latest_scan_->ranges.size();
+    if (num_readings == 0)
+    {
+        return 0.0f;
+    }
+    
+    float angle_min = latest_scan_->angle_min;
+    float angle_increment = latest_scan_->angle_increment;
+    
+    auto angle_to_index = [&](float angle) -> size_t {
+        angle = std::clamp(angle, angle_min, latest_scan_->angle_max);
+        int idx = static_cast<int>((angle - angle_min) / angle_increment);
+        return static_cast<size_t>(std::clamp(idx, 0, static_cast<int>(num_readings - 1)));
+    };
+    
+    // Calculate min ranges for left and right
+    size_t left_start = angle_to_index(0.0f);
+    size_t left_end = angle_to_index(1.57f);
+    size_t right_start = angle_to_index(-1.57f);
+    size_t right_end = angle_to_index(0.0f);
+    
+    float min_left = 50.0f;
+    float min_right = 50.0f;
+    
+    for (size_t i = left_start; i <= left_end && i < num_readings; ++i)
+    {
+        if (std::isfinite(latest_scan_->ranges[i]) && latest_scan_->ranges[i] > 0.1f)
+            min_left = std::min(min_left, latest_scan_->ranges[i]);
+    }
+    
+    for (size_t i = right_start; i <= right_end && i < num_readings; ++i)
+    {
+        if (std::isfinite(latest_scan_->ranges[i]) && latest_scan_->ranges[i] > 0.1f)
+            min_right = std::min(min_right, latest_scan_->ranges[i]);
+    }
+    
+    // Steer away from closer obstacle
+    if (min_left < min_right)
+    {
+        return -max_steer_ * (1.0f - min_left / obstacle_slow_m_);  // Turn right
+    }
+    else
+    {
+        return max_steer_ * (1.0f - min_right / obstacle_slow_m_);  // Turn left
+    }
+}
+
+// =============================================================================
+// Corner Detection and Escape Functions
+// =============================================================================
+
+bool NavBallCollectorNode::detect_corner_situation()
+{
+    if (!latest_scan_)
+    {
+        return false;
+    }
+    
+    float min_front, min_left, min_right;
+    check_obstacle_sectors(min_front, min_left, min_right);
+    
+    // Corner detection: front is blocked AND one or both sides are blocked
+    bool front_blocked = min_front < obstacle_slow_m_;
+    bool left_blocked = min_left < obstacle_slow_m_ * 0.8;
+    bool right_blocked = min_right < obstacle_slow_m_ * 0.8;
+    
+    // True corner: front blocked and at least one side blocked
+    if (front_blocked && (left_blocked || right_blocked))
+    {
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "Corner detected: front=%.2f, left=%.2f, right=%.2f",
+            min_front, min_left, min_right);
+        return true;
+    }
+    
+    // Deep corner: both sides and front blocked (very tight space)
+    if (min_front < obstacle_slow_m_ * 1.5 && left_blocked && right_blocked)
+    {
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "Deep corner detected: front=%.2f, left=%.2f, right=%.2f",
+            min_front, min_left, min_right);
+        return true;
+    }
+    
+    return false;
+}
+
+bool NavBallCollectorNode::find_escape_direction(float & best_angle, float & best_distance)
+{
+    if (!latest_scan_)
+    {
+        return false;
+    }
+    
+    size_t num_readings = latest_scan_->ranges.size();
+    if (num_readings == 0)
+    {
+        return false;
+    }
+    
+    float angle_min = latest_scan_->angle_min;
+    float angle_increment = latest_scan_->angle_increment;
+    
+    // Find the widest gap (most open direction)
+    best_angle = 0.0f;
+    best_distance = 0.0f;
+    
+    // Sliding window for gap detection
+    const int window_size = num_readings / 12;  // ~30 degree window
+    float max_avg_distance = 0.0f;
+    
+    for (size_t center = window_size; center < num_readings - window_size; ++center)
+    {
+        float sum_distance = 0.0f;
+        int valid_count = 0;
+        
+        for (int offset = -window_size; offset <= window_size; ++offset)
+        {
+            size_t idx = center + offset;
+            if (std::isfinite(latest_scan_->ranges[idx]) && 
+                latest_scan_->ranges[idx] > 0.1f &&
+                latest_scan_->ranges[idx] < 50.0f)
+            {
+                sum_distance += latest_scan_->ranges[idx];
+                valid_count++;
+            }
+        }
+        
+        if (valid_count > window_size)  // At least half the window has valid readings
+        {
+            float avg_distance = sum_distance / valid_count;
+            
+            // Prefer directions that are more to the side (better for turning)
+            float angle = angle_min + center * angle_increment;
+            float side_bonus = std::abs(angle) * 0.5f;  // Bonus for side directions
+            float effective_distance = avg_distance + side_bonus;
+            
+            if (effective_distance > max_avg_distance)
+            {
+                max_avg_distance = effective_distance;
+                best_angle = angle;
+                best_distance = avg_distance;
+            }
+        }
+    }
+    
+    // Only return true if we found a reasonably open direction
+    // Also check if this direction is blocked
+    for (float blocked : blocked_directions_)
+    {
+        if (std::abs(best_angle - blocked) < 0.5f)
+        {
+            // This direction is blocked, find next best
+            best_distance *= 0.3f;  // Penalize this direction heavily
+        }
+    }
+    
+    return best_distance > obstacle_stop_m_ * 1.5;
+}
+
+bool NavBallCollectorNode::execute_lidar_escape()
+{
+    double elapsed = (this->now() - corner_escape_start_time_).seconds();
+    
+    // Clear blocked directions after 10 seconds
+    if ((this->now() - blocked_directions_clear_time_).seconds() > 10.0)
+    {
+        blocked_directions_.clear();
+        blocked_directions_clear_time_ = this->now();
+    }
+    
+    // Phase timing - MUCH LESS BACKUP, MORE FORWARD!
+    const double backup_duration = 0.4;       // Very short backup
+    const double turn_duration = 1.0;         // Quick turn
+    const double forward_duration = 2.0;      // LONG forward - escape by going forward!
+    const double total_duration = backup_duration + turn_duration + forward_duration;
+    
+    float min_front, min_left, min_right;
+    check_obstacle_sectors(min_front, min_left, min_right);
+    
+    if (elapsed < backup_duration)
+    {
+        // Phase 1: SHORT BACKUP - just create a tiny bit of space
+        escape_phase_ = 1;
+        publish_cmd_vel(-recover_speed_ * 0.8, 0.0);
+    }
+    else if (elapsed < backup_duration + turn_duration)
+    {
+        // Phase 2: TURN towards escape direction
+        escape_phase_ = 2;
+        
+        float turn_dir = (escape_target_angle_ > 0) ? 1.0f : -1.0f;
+        
+        // While turning, check if front clears - if so, go forward immediately
+        if (min_front > obstacle_slow_m_)
+        {
+            // Front is clear! Skip to forward phase
+            publish_cmd_vel(approach_speed_, turn_dir * max_steer_ * 0.3);
+        }
+        else
+        {
+            // Turn with slight forward motion (Ackermann needs motion to turn)
+            publish_cmd_vel(approach_speed_ * 0.3, turn_dir * max_steer_ * 1.8);
+        }
+    }
+    else if (elapsed < total_duration)
+    {
+        // Phase 3: FORWARD - this is the main escape phase!
+        escape_phase_ = 3;
+        
+        if (min_front > obstacle_stop_m_)
+        {
+            // Go forward! Slight steering to keep avoiding
+            float steer = 0.0f;
+            if (min_left < obstacle_slow_m_ && min_right > min_left)
+            {
+                steer = -max_steer_ * 0.5f;  // Steer right, away from left obstacle
+            }
+            else if (min_right < obstacle_slow_m_ && min_left > min_right)
+            {
+                steer = max_steer_ * 0.5f;   // Steer left, away from right obstacle
+            }
+            
+            publish_cmd_vel(approach_speed_ * 1.2, steer);
+        }
+        else
+        {
+            // Front blocked - turn more aggressively
+            float turn_dir = (min_left > min_right) ? 1.0f : -1.0f;
+            publish_cmd_vel(approach_speed_ * 0.2, turn_dir * max_steer_ * 2.0);
+        }
+    }
+    else
+    {
+        // Escape attempt complete - check if successful
+        if (min_front > obstacle_slow_m_)
+        {
+            RCLCPP_INFO(this->get_logger(), "ESCAPE: Success! Front clear at %.2fm", min_front);
+            
+            if (latest_odom_)
+            {
+                last_escape_x_ = latest_odom_->pose.pose.position.x;
+                last_escape_y_ = latest_odom_->pose.pose.position.y;
+            }
+            last_progress_time_ = this->now();
+            same_direction_attempts_ = 0;
+            blocked_directions_.clear();
+            
+            return true;  // Escape complete!
+        }
+        else
+        {
+            // Failed - add this direction to blocked list
+            blocked_directions_.push_back(escape_target_angle_);
+            same_direction_attempts_++;
+            
+            RCLCPP_WARN(this->get_logger(), 
+                "ESCAPE: Direction %.2f rad BLOCKED! Attempt #%d, trying different direction", 
+                escape_target_angle_, same_direction_attempts_);
+            
+            // Find a completely different direction
+            float best_angle = 0.0f;
+            float best_dist = 0.0f;
+            
+            // Scan for the most open direction that's NOT blocked
+            if (latest_scan_)
+            {
+                size_t num_readings = latest_scan_->ranges.size();
+                float angle_min = latest_scan_->angle_min;
+                float angle_increment = latest_scan_->angle_increment;
+                
+                for (size_t i = 0; i < num_readings; i += num_readings / 8)
+                {
+                    float angle = angle_min + i * angle_increment;
+                    float range = latest_scan_->ranges[i];
+                    
+                    if (!std::isfinite(range) || range < 0.1f)
+                        continue;
+                    
+                    // Check if this direction is blocked
+                    bool is_blocked = false;
+                    for (float blocked : blocked_directions_)
+                    {
+                        if (std::abs(angle - blocked) < 0.8f)
+                        {
+                            is_blocked = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!is_blocked && range > best_dist)
+                    {
+                        best_dist = range;
+                        best_angle = angle;
+                    }
+                }
+            }
+            
+            if (best_dist > obstacle_stop_m_)
+            {
+                escape_target_angle_ = best_angle;
+                RCLCPP_INFO(this->get_logger(), 
+                    "ESCAPE: Found unblocked direction: %.2f rad (%.2fm clear)", 
+                    best_angle, best_dist);
+            }
+            else
+            {
+                // All directions seem blocked - try opposite of last attempt
+                escape_target_angle_ = -escape_target_angle_;
+                
+                // If we've tried too many times, clear blocked list and start fresh
+                if (same_direction_attempts_ >= 4)
+                {
+                    blocked_directions_.clear();
+                    same_direction_attempts_ = 0;
+                    RCLCPP_WARN(this->get_logger(), "ESCAPE: Clearing blocked list, starting fresh");
+                }
+            }
+            
+            corner_escape_start_time_ = this->now();
+            escape_phase_ = 0;
+            last_escape_direction_ = escape_target_angle_;
+            
+            return false;  // Continue escaping
+        }
+    }
+    
+    return false;  // Still escaping
+}
+
+bool NavBallCollectorNode::is_stuck()
+{
+    if (!latest_odom_)
+    {
+        return false;
+    }
+    
+    // Check time since last progress
+    double time_since_progress = (this->now() - last_progress_time_).seconds();
+    
+    // Consider stuck if no progress for 5 seconds
+    if (time_since_progress > 5.0)
+    {
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Stuck detection: %.1fs since progress", time_since_progress);
+        return true;
+    }
+    
+    // Also check if front is blocked for too long
+    float min_front, min_left, min_right;
+    check_obstacle_sectors(min_front, min_left, min_right);
+    
+    if (min_front < obstacle_stop_m_ && time_since_progress > 2.0)
+    {
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Stuck: front blocked (%.2fm) for %.1fs", min_front, time_since_progress);
+        return true;
+    }
+    
+    return false;
+}
+
+void NavBallCollectorNode::publish_cmd_vel(float linear, float angular)
+{
+    geometry_msgs::msg::Twist cmd;
+    cmd.linear.x = linear;
+    cmd.angular.z = angular;
+    cmd_vel_pub_->publish(cmd);
+}
+
+void NavBallCollectorNode::delete_entity(const std::string & entity_name)
+{
+    if (!delete_client_->wait_for_service(std::chrono::seconds(1)))
+    {
+        RCLCPP_WARN(this->get_logger(), "Delete service not available");
+        delete_pending_ = false;
+        transition_to(NavCollectorState::RECOVERING);
+        return;
+    }
+    
+    // Store the base entity name and determine the name to try
+    std::string name_to_try;
+    if (delete_attempt_ == 0)
+    {
+        name_to_try = entity_name;
+    }
+    else
+    {
+        // Try with _2 suffix
+        name_to_try = entity_name + "_2";
+    }
+    current_delete_name_ = name_to_try;
+    
+    RCLCPP_INFO(this->get_logger(), "Attempting to delete entity: %s (attempt %d)", 
+        name_to_try.c_str(), delete_attempt_ + 1);
+    
+    auto request = std::make_shared<ros_gz_interfaces::srv::DeleteEntity::Request>();
+    request->entity.name = name_to_try;
+    request->entity.type = 2;  // MODEL type
+    
+    delete_client_->async_send_request(request,
+        std::bind(&NavBallCollectorNode::delete_entity_callback, this, std::placeholders::_1));
+}
+
+void NavBallCollectorNode::delete_entity_callback(
+    rclcpp::Client<ros_gz_interfaces::srv::DeleteEntity>::SharedFuture future)
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    try
+    {
+        auto result = future.get();
+        if (result->success)
+        {
+            // Reset delete attempts on success
+            delete_attempt_ = 0;
+            delete_pending_ = false;
+            
+            RCLCPP_INFO(this->get_logger(), 
+                "Successfully collected ball '%s' (deleted: %s)!", 
+                target_ball_.name.c_str(), current_delete_name_.c_str());
+            
+            // Track collection
+            collected_balls_.insert(current_delete_name_);
+            ball_collect_count_[target_ball_.color]++;
+            last_collection_time_ = this->now();
+            
+            // Log stats
+            int total = 0;
+            for (const auto & pair : ball_collect_count_)
+            {
+                total += pair.second;
+                RCLCPP_INFO(this->get_logger(), "  %s balls: %d", 
+                    pair.first.c_str(), pair.second);
+            }
+            RCLCPP_INFO(this->get_logger(), "Total collected: %d", total);
+            
+            // Spawn new ball with the same name that was deleted
+            spawn_ball_with_name(target_ball_.color, current_delete_name_);
+            
+            // Reset target and continue exploring
+            target_ball_.valid = false;
+            transition_to(NavCollectorState::EXPLORING);
+        }
+        else
+        {
+            // Try alternative name if first attempt failed
+            if (delete_attempt_ < 1)
+            {
+                RCLCPP_WARN(this->get_logger(), 
+                    "Failed to delete '%s', trying alternative name...", 
+                    current_delete_name_.c_str());
+                delete_attempt_++;
+                delete_pending_ = true;  // Keep pending
+                delete_entity(target_ball_.name);  // Try again with next variant
+            }
+            else
+            {
+                // Both attempts failed - count as collected anyway and move on
+                RCLCPP_WARN(this->get_logger(), 
+                    "Could not find ball entity to delete - marking as collected anyway");
+                delete_attempt_ = 0;
+                delete_pending_ = false;
+                
+                // Still count the collection
+                ball_collect_count_[target_ball_.color]++;
+                last_collection_time_ = this->now();
+                
+                // Spawn new ball with base name
+                spawn_ball(target_ball_.color);
+                
+                target_ball_.valid = false;
+                transition_to(NavCollectorState::EXPLORING);
+            }
+        }
+    }
+    catch (const std::exception & e)
+    {
+        RCLCPP_ERROR(this->get_logger(), "Delete service exception: %s", e.what());
+        delete_attempt_ = 0;
+        delete_pending_ = false;
+        transition_to(NavCollectorState::RECOVERING);
+    }
+}
+
+void NavBallCollectorNode::spawn_ball(const std::string & color)
+{
+    std::string entity_name = get_entity_name(color);
+    spawn_ball_with_name(color, entity_name);
+}
+
+void NavBallCollectorNode::spawn_ball_with_name(const std::string & color, const std::string & entity_name)
+{
+    if (!spawn_client_->wait_for_service(std::chrono::seconds(1)))
+    {
+        RCLCPP_WARN(this->get_logger(), "Spawn service not available");
+        return;
+    }
+    
+    double x, y;
+    get_random_spawn_position(x, y);
+    
+    auto request = std::make_shared<ros_gz_interfaces::srv::SpawnEntity::Request>();
+    request->entity_factory.name = entity_name;
+    request->entity_factory.sdf = generate_ball_sdf(color, entity_name);
+    request->entity_factory.pose.position.x = x;
+    request->entity_factory.pose.position.y = y;
+    request->entity_factory.pose.position.z = 0.1;
+    
+    spawn_client_->async_send_request(request,
+        std::bind(&NavBallCollectorNode::spawn_entity_callback, this, std::placeholders::_1));
+    
+    RCLCPP_INFO(this->get_logger(), "Spawning new %s ball '%s' at (%.2f, %.2f)", 
+        color.c_str(), entity_name.c_str(), x, y);
+}
+
+void NavBallCollectorNode::spawn_entity_callback(
+    rclcpp::Client<ros_gz_interfaces::srv::SpawnEntity>::SharedFuture future)
+{
+    try
+    {
+        auto result = future.get();
+        if (result->success)
+        {
+            RCLCPP_INFO(this->get_logger(), "Successfully spawned new ball");
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "Failed to spawn ball");
+        }
+    }
+    catch (const std::exception & e)
+    {
+        RCLCPP_ERROR(this->get_logger(), "Spawn service exception: %s", e.what());
+    }
+}
+
+std::string NavBallCollectorNode::generate_ball_sdf(
+    const std::string & color, const std::string & entity_name)
+{
+    // Color RGB values
+    std::string rgb;
+    if (color == "red") rgb = "1 0 0 1";
+    else if (color == "green") rgb = "0 1 0 1";
+    else if (color == "blue") rgb = "0 0 1 1";
+    else if (color == "yellow") rgb = "1 1 0 1";
+    else rgb = "1 0 1 1";  // Magenta for unknown
+    
+    std::string sdf = R"(
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <model name=")" + entity_name + R"(">
+    <static>false</static>
+    <link name="link">
+      <pose>0 0 0.075 0 0 0</pose>
+      <inertial>
+        <mass>0.1</mass>
+        <inertia>
+          <ixx>0.000225</ixx>
+          <iyy>0.000225</iyy>
+          <izz>0.000225</izz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <sphere><radius>0.075</radius></sphere>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <sphere><radius>0.075</radius></sphere>
+        </geometry>
+        <material>
+          <ambient>)" + rgb + R"(</ambient>
+          <diffuse>)" + rgb + R"(</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
+)";
+    return sdf;
+}
+
+void NavBallCollectorNode::get_random_spawn_position(double & x, double & y)
+{
+    // Random position in arena (adjust based on your world size)
+    std::uniform_real_distribution<double> x_dist(-4.0, 4.0);
+    std::uniform_real_distribution<double> y_dist(-4.0, 4.0);
+    
+    x = x_dist(rng_);
+    y = y_dist(rng_);
+}
+
+std::string NavBallCollectorNode::get_entity_name(const std::string & color)
+{
+    static std::map<std::string, int> counters;
+    counters[color]++;
+    return color + "_ball_" + std::to_string(counters[color]);
+}
+
+}  // namespace ballvac_ball_collector
+
+// =============================================================================
+// Main function
+// =============================================================================
+
+int main(int argc, char * argv[])
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<ballvac_ball_collector::NavBallCollectorNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

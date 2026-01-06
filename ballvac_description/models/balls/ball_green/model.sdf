@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<!--
+  Green Ball Model for Gazebo Sim
+  This is a simple sphere model with green material for ball collection demo.
+  Entity name: ball_green
+-->
+<sdf version="1.8">
+  <model name="ball_green">
+    <static>false</static>
+    <link name="ball_link">
+      <inertial>
+        <mass>0.1</mass>
+        <inertia>
+          <ixx>0.00004</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00004</iyy>
+          <iyz>0</iyz>
+          <izz>0.00004</izz>
+        </inertia>
+      </inertial>
+      
+      <collision name="collision">
+        <geometry>
+          <sphere>
+            <radius>0.1</radius>
+          </sphere>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>0.5</mu>
+              <mu2>0.5</mu2>
+            </ode>
+          </friction>
+          <bounce>
+            <restitution_coefficient>0.5</restitution_coefficient>
+          </bounce>
+        </surface>
+      </collision>
+      
+      <visual name="visual">
+        <geometry>
+          <sphere>
+            <radius>0.1</radius>
+          </sphere>
+        </geometry>
+        <material>
+          <ambient>0.0 1.0 0.0 1</ambient>
+          <diffuse>0.0 1.0 0.0 1</diffuse>
+          <specular>0.5 0.5 0.5 1</specular>
+          <emissive>0.0 0.1 0.0 1</emissive>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
