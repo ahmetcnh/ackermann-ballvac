@@ -81,6 +81,8 @@ ament_target_dependencies(ball_launcher_node
   rclcpp_components
   std_msgs
   std_srvs
+  geometry_msgs
+  ballvac_msgs
   ros_gz_interfaces
 )
 
@@ -139,6 +141,22 @@ ament_target_dependencies(nav_ball_collector_node
   tf2_geometry_msgs
 )
 
+# ==============================================================================
+# Fleet Coordinator Node - Central coordinator for multi-robot ball collection
+# ==============================================================================
+add_executable(fleet_coordinator_node
+  src/fleet_coordinator_node.cpp
+)
+ament_target_dependencies(fleet_coordinator_node
+  rclcpp
+  rclcpp_action
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  std_msgs
+  ballvac_msgs
+)
+
 # Install targets
 install(
   TARGETS
@@ -148,6 +166,7 @@ install(
     exploration_collector_node
     odom_tf_publisher
     nav_ball_collector_node
+    fleet_coordinator_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -160,6 +179,12 @@ install(
 # Install config files
 install(
   DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# Install behavior tree files
+install(
+  DIRECTORY behavior_trees
   DESTINATION share/${PROJECT_NAME}
 )
 

@@ -10,6 +10,7 @@
  * - Transforms ball detections to map coordinates
  * - Plans optimal paths avoiding obstacles
  * - Falls back to reactive control when needed
+ * - Multi-robot support with fleet coordinator integration
  */
 
 #ifndef BALLVAC_BALL_COLLECTOR__NAV_BALL_COLLECTOR_NODE_HPP_
@@ -26,6 +27,10 @@
 #include <nav2_msgs/action/compute_path_to_pose.hpp>
 #include <ballvac_msgs/msg/ball_detection.hpp>
 #include <ballvac_msgs/msg/ball_detection_array.hpp>
+#include <ballvac_msgs/msg/robot_assignment.hpp>
+#include <ballvac_msgs/msg/robot_status.hpp>
+#include <ballvac_msgs/msg/ball_registry.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <ros_gz_interfaces/srv/delete_entity.hpp>
 #include <ros_gz_interfaces/srv/spawn_entity.hpp>
 #include <tf2_ros/buffer.h>
@@ -119,7 +124,22 @@ private:
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
     void detection_callback(const ballvac_msgs::msg::BallDetectionArray::SharedPtr msg);
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
+    void assignment_callback(const ballvac_msgs::msg::RobotAssignment::SharedPtr msg);
+    void ball_registry_callback(const ballvac_msgs::msg::BallRegistry::SharedPtr msg);
+    void heartbeat_timer_callback();
+    void deleted_ball_callback(const std_msgs::msg::String::SharedPtr msg);
+    void pose_log_timer_callback();
     void control_loop();
+    
+    // =========================================================================
+    // Fleet coordination functions
+    // =========================================================================
+    
+    void publish_robot_status(uint8_t action, const std::string & action_ball_id = "");
+    void publish_claim(const std::string & ball_id);
+    void publish_collected(const std::string & ball_id);
+    void publish_lost(const std::string & ball_id);
+    bool is_ball_claimed_by_other(const std::string & ball_id);
 
     // =========================================================================
     // Navigation Action Callbacks
@@ -187,8 +207,26 @@ private:
 
     bool check_obstacle_front(float & min_range);
     void check_obstacle_sectors(float & min_front, float & min_left, float & min_right);
+    void check_diagonal_sectors(float & min_front_left, float & min_front_right);
     float compute_obstacle_avoidance_steering();
     void publish_cmd_vel(float linear, float angular);
+    
+    /**
+     * @brief Check if ball position is near a wall
+     */
+    bool is_ball_near_wall(const geometry_msgs::msg::PoseStamped & ball_pose, double threshold = 1.5);
+    
+    /**
+     * @brief Calculate safe approach offset for wall-adjacent balls
+     * Returns an offset pose that allows approaching the ball from a safe direction
+     */
+    geometry_msgs::msg::PoseStamped calculate_safe_approach_pose(
+        const geometry_msgs::msg::PoseStamped & ball_pose);
+    
+    /**
+     * @brief Check if current approach path is blocked by wall
+     */
+    bool is_approach_path_blocked();
     
     // =========================================================================
     // Fast LiDAR-based corner escape functions
@@ -239,9 +277,14 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
     rclcpp::Subscription<ballvac_msgs::msg::BallDetectionArray>::SharedPtr detection_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<ballvac_msgs::msg::RobotAssignment>::SharedPtr assignment_sub_;
+    rclcpp::Subscription<ballvac_msgs::msg::BallRegistry>::SharedPtr ball_registry_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr deleted_ball_sub_;
     
     // Publishers
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    rclcpp::Publisher<ballvac_msgs::msg::RobotStatus>::SharedPtr robot_status_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ball_deleted_pub_;
     
     // Action client for Nav2
     rclcpp_action::Client<NavigateToPose>::SharedPtr nav_to_pose_client_;
@@ -252,6 +295,7 @@ private:
     
     // Timer
     rclcpp::TimerBase::SharedPtr control_timer_;
+    rclcpp::TimerBase::SharedPtr pose_log_timer_;
     
     // TF2
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -269,6 +313,18 @@ private:
     std::string delete_service_;
     std::string spawn_service_;
     
+    // Fleet coordination
+    std::string robot_id_;
+    bool use_fleet_coordinator_;
+    std::string assignment_topic_;
+    std::string robot_status_topic_;
+    
+    // Exploration bounds (20m x 20m)
+    double exploration_min_x_;
+    double exploration_max_x_;
+    double exploration_min_y_;
+    double exploration_max_y_;
+    
     // Frame IDs
     std::string map_frame_;
     std::string robot_frame_;
@@ -282,6 +338,8 @@ private:
     double approach_speed_;
     double max_steer_;
     double control_rate_;
+    bool respawn_balls_;
+    double pose_log_interval_;
     
     // Approach parameters
     double steering_gain_;
@@ -297,6 +355,7 @@ private:
     double max_ball_radius_;
     double collection_cooldown_;
     double target_lost_timeout_;
+    double ball_visible_timeout_;
     
     // Camera parameters for distance estimation
     double camera_fov_horizontal_;      // Horizontal FOV in radians
@@ -307,6 +366,10 @@ private:
     // Exploration parameters
     double exploration_waypoint_distance_;
     double exploration_timeout_;
+    bool explore_with_nav2_;
+    double nav_goal_retry_cooldown_;
+    double wander_bias_interval_;
+    double wander_bias_max_;
 
     // =========================================================================
     // State variables
@@ -326,20 +389,33 @@ private:
     // Navigation state
     bool navigation_in_progress_;
     bool navigation_succeeded_;
+    bool nav2_ready_;  // Flag to track if Nav2 is ready
     GoalHandleNavigateToPose::SharedPtr current_goal_handle_;
     geometry_msgs::msg::PoseStamped current_nav_goal_;
     rclcpp::Time last_goal_rejection_time_;  // Cooldown for rejected goals
     int consecutive_rejections_;              // Count consecutive rejections
+    rclcpp::Time last_nav_result_time_;
     
     // Exploration state
     std::vector<geometry_msgs::msg::PoseStamped> exploration_history_;
     int exploration_waypoint_index_;
     rclcpp::Time exploration_start_time_;
+    rclcpp::Time last_wander_bias_time_;
+    double wander_bias_;
     
     // Ball collection tracking
     std::set<std::string> collected_balls_;
     std::map<std::string, int> ball_collect_count_;
     rclcpp::Time last_collection_time_;
+    
+    // Fleet coordination state
+    ballvac_msgs::msg::RobotAssignment current_assignment_;
+    bool has_active_assignment_;
+    rclcpp::Time last_heartbeat_time_;
+    rclcpp::TimerBase::SharedPtr heartbeat_timer_;
+    
+    // Fleet coordination - claimed balls tracking
+    std::map<std::string, std::string> claimed_balls_;  // ball_id -> robot_id that claimed it
     
     // Recovery state
     rclcpp::Time recover_start_time_;

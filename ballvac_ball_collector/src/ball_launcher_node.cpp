@@ -8,6 +8,7 @@
 
 #include "ballvac_ball_collector/ball_launcher_node.hpp"
 #include <cmath>
+#include <algorithm>
 
 namespace ballvac_ball_collector
 {
@@ -59,9 +60,11 @@ BallLauncherNode::BallLauncherNode(const rclcpp::NodeOptions & options)
     this->declare_parameter<double>("launch_interval", 8.0);  // seconds
     this->declare_parameter<int>("max_balls", 20);
     this->declare_parameter<bool>("auto_launch", true);
+    this->declare_parameter<bool>("respawn_on_delete", true);
     launch_interval_ = this->get_parameter("launch_interval").as_double();
     max_balls_ = this->get_parameter("max_balls").as_int();
     auto_launch_ = this->get_parameter("auto_launch").as_bool();
+    respawn_on_delete_ = this->get_parameter("respawn_on_delete").as_bool();
     
     // -------------------------------------------------------------------------
     // Initialize colors
@@ -92,6 +95,16 @@ BallLauncherNode::BallLauncherNode(const rclcpp::NodeOptions & options)
     launch_info_pub_ = this->create_publisher<std_msgs::msg::String>(
         "~/launch_info", 10);
     
+    // Ball detection publisher for fleet coordinator
+    // This publishes the ground-truth positions of spawned balls
+    ball_detection_pub_ = this->create_publisher<ballvac_msgs::msg::BallDetectionArray>(
+        "/fleet/ball_positions", rclcpp::SensorDataQoS());
+    
+    // Subscribe to ball deletion events to respawn balls
+    ball_deleted_sub_ = this->create_subscription<std_msgs::msg::String>(
+        "/fleet/ball_deleted", 10,
+        std::bind(&BallLauncherNode::ball_deleted_callback, this, std::placeholders::_1));
+    
     // Auto launch timer
     if (auto_launch_)
     {
@@ -99,6 +112,32 @@ BallLauncherNode::BallLauncherNode(const rclcpp::NodeOptions & options)
             std::chrono::duration<double>(launch_interval_),
             std::bind(&BallLauncherNode::launch_timer_callback, this));
     }
+    
+    // Periodic ball position publisher (for fleet coordinator)
+    auto ball_position_timer = this->create_wall_timer(
+        std::chrono::milliseconds(500),
+        [this]() {
+            if (spawned_balls_.empty()) return;
+            
+            ballvac_msgs::msg::BallDetectionArray msg;
+            msg.header.stamp = this->now();
+            msg.header.frame_id = "map";
+            
+            for (const auto & ball : spawned_balls_) {
+                ballvac_msgs::msg::BallDetection det;
+                det.header = msg.header;
+                det.name = ball.name;
+                det.color = ball.color;
+                det.confidence = 1.0;  // Ground truth
+                // Use center_x/center_y as a hack to send world position
+                // (fleet coordinator will need to read these)
+                det.center_x = static_cast<int>(ball.x * 1000);  // mm precision
+                det.center_y = static_cast<int>(ball.y * 1000);
+                msg.detections.push_back(det);
+            }
+            
+            ball_detection_pub_->publish(msg);
+        });
     
     // -------------------------------------------------------------------------
     // Log startup
@@ -113,6 +152,7 @@ BallLauncherNode::BallLauncherNode(const rclcpp::NodeOptions & options)
     RCLCPP_INFO(this->get_logger(), "  Launch interval: %.1f s", launch_interval_);
     RCLCPP_INFO(this->get_logger(), "  Max balls: %d", max_balls_);
     RCLCPP_INFO(this->get_logger(), "  Auto launch: %s", auto_launch_ ? "yes" : "no");
+    RCLCPP_INFO(this->get_logger(), "  Respawn on delete: %s", respawn_on_delete_ ? "yes" : "no");
     RCLCPP_INFO(this->get_logger(), "========================================");
     
     // Launch first ball after a short delay
@@ -225,6 +265,21 @@ void BallLauncherNode::launch_ball()
         std::bind(&BallLauncherNode::spawn_callback, this, std::placeholders::_1));
     
     balls_launched_++;
+    
+    // Track spawned ball for fleet coordinator
+    // Remove old ball of same color if exists
+    spawned_balls_.erase(
+        std::remove_if(spawned_balls_.begin(), spawned_balls_.end(),
+            [&entity_name](const SpawnedBall& b) { return b.name == entity_name; }),
+        spawned_balls_.end());
+    
+    // Add new ball
+    SpawnedBall ball_info;
+    ball_info.name = entity_name;
+    ball_info.color = color;
+    ball_info.x = spawn_x;
+    ball_info.y = spawn_y;
+    spawned_balls_.push_back(ball_info);
     
     // Publish launch info
     auto msg = std_msgs::msg::String();
@@ -347,6 +402,38 @@ void BallLauncherNode::get_color_rgb(const std::string & color,
     } else {
         ambient = "1.0 1.0 1.0 1"; diffuse = "1.0 1.0 1.0 1"; emissive = "0.1 0.1 0.1 1";
     }
+}
+
+// =============================================================================
+// Ball deleted callback - respawn a new ball when one is collected
+// =============================================================================
+
+void BallLauncherNode::ball_deleted_callback(const std_msgs::msg::String::SharedPtr msg)
+{
+    if (!respawn_on_delete_)
+    {
+        return;
+    }
+
+    std::string deleted_ball = msg->data;
+    
+    RCLCPP_INFO(this->get_logger(), "Ball deleted notification: %s - spawning replacement", 
+        deleted_ball.c_str());
+    
+    // Remove from tracking
+    spawned_balls_.erase(
+        std::remove_if(spawned_balls_.begin(), spawned_balls_.end(),
+            [&deleted_ball](const SpawnedBall& b) { return b.name == deleted_ball; }),
+        spawned_balls_.end());
+    
+    // Wait a moment, then spawn a new ball
+    auto respawn_timer = this->create_wall_timer(
+        std::chrono::milliseconds(500),
+        [this]() {
+            this->launch_ball();
+        });
+    // Cancel after one shot - create_wall_timer doesn't have one_shot option,
+    // so we'll just let it fire once and it will be cleaned up
 }
 
 }  // namespace ballvac_ball_collector

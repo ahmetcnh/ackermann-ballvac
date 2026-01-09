@@ -11,8 +11,12 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <ros_gz_interfaces/srv/spawn_entity.hpp>
+#include <ros_gz_interfaces/srv/delete_entity.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include "ballvac_msgs/msg/ball_detection.hpp"
+#include "ballvac_msgs/msg/ball_detection_array.hpp"
 
 #include <random>
 #include <string>
@@ -48,6 +52,11 @@ private:
      */
     void spawn_callback(
         rclcpp::Client<ros_gz_interfaces::srv::SpawnEntity>::SharedFuture future);
+    
+    /**
+     * @brief Callback when a ball is deleted/collected - respawn a new one
+     */
+    void ball_deleted_callback(const std_msgs::msg::String::SharedPtr msg);
     
     // =========================================================================
     // Helper functions
@@ -89,6 +98,8 @@ private:
     rclcpp::Client<ros_gz_interfaces::srv::SpawnEntity>::SharedPtr spawn_client_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr manual_launch_srv_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr launch_info_pub_;
+    rclcpp::Publisher<ballvac_msgs::msg::BallDetectionArray>::SharedPtr ball_detection_pub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr ball_deleted_sub_;
     rclcpp::TimerBase::SharedPtr launch_timer_;
     
     // =========================================================================
@@ -114,6 +125,7 @@ private:
     double launch_interval_;    // Seconds between automatic launches
     int max_balls_;            // Maximum balls to launch
     bool auto_launch_;         // Whether to launch automatically
+    bool respawn_on_delete_;   // Whether to respawn on delete events
     
     // =========================================================================
     // State
@@ -123,6 +135,15 @@ private:
     int balls_launched_;
     int ball_counter_;  // For unique naming
     std::vector<std::string> colors_;
+    
+    // Track spawned balls for publishing detections
+    struct SpawnedBall {
+        std::string name;
+        std::string color;
+        double x;
+        double y;
+    };
+    std::vector<SpawnedBall> spawned_balls_;
 };
 
 }  // namespace ballvac_ball_collector

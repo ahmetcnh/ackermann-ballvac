@@ -94,6 +94,7 @@ void Control::sub_callback(ballvac_msgs::msg::Map::SharedPtr msg)
 }
 void Control::service_callback(const ballvac_msgs::srv::ShareMap::Request::SharedPtr request, const ballvac_msgs::srv::ShareMap::Response::SharedPtr response)
 {
+    (void)request;
     auto merged_map = nav_msgs::msg::OccupancyGrid(); // TODO: merged map paylaşılacak.
     response->custom_occupany_grid = merged_map;
     response->is_completed = true;

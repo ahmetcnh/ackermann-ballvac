@@ -12,15 +12,23 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Map.msg"
   "msg/BallDetection.msg"
   "msg/BallDetectionArray.msg"
+  "msg/BallState.msg"
+  "msg/BallRegistry.msg"
+  "msg/RobotAssignment.msg"
+  "msg/RobotStatus.msg"
+  "msg/FleetAssignments.msg"
   "srv/ShareMap.srv"
-  DEPENDENCIES std_msgs nav_msgs nav2_msgs
+  DEPENDENCIES std_msgs nav_msgs nav2_msgs geometry_msgs builtin_interfaces
 )
+
+ament_export_dependencies(rosidl_default_runtime)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
