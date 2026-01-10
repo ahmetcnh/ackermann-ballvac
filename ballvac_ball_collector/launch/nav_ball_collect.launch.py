@@ -150,7 +150,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'scan_topic': '/scan',
             'detection_topic': '/ball_detections',
-            'cmd_topic': '/cmd_vel',
+            'cmd_topic': '/cmd_vel_in',
             'odom_topic': '/odom',
             'delete_service': '/world/ball_arena/remove',
             'spawn_service': '/world/ball_arena/create',
@@ -178,6 +178,21 @@ def generate_launch_description():
             'recover_duration': 0.4,
             'recover_speed': 0.8,
         }],
+    )
+
+    # ==========================================================================
+    # Motion Controller Node
+    # ==========================================================================
+
+    motion_controller_node = Node(
+        package='ballvac_control',
+        executable='motion_controller_node',
+        name='motion_controller_node',
+        output='screen',
+        parameters=[{
+            'input_topic': '/cmd_vel_in',
+            'output_topic': '/cmd_vel',
+        }]
     )
     
     # ==========================================================================
@@ -217,6 +232,7 @@ def generate_launch_description():
         
         # Ball collection nodes
         ball_perception_node,
+        motion_controller_node,
         nav_ball_collector_node,
         
         # Visualization (optional, simulation already has RViz)

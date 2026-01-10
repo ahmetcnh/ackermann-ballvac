@@ -89,7 +89,7 @@ BallPerceptionNode::BallPerceptionNode(const rclcpp::NodeOptions & options)
     RCLCPP_INFO(this->get_logger(), "  Debug image: %s", publish_debug_image_ ? "enabled" : "disabled");
     RCLCPP_INFO(this->get_logger(), "  Min contour area: %d px^2", min_contour_area_);
     RCLCPP_INFO(this->get_logger(), "  Camera HFOV: %.3f rad", camera_hfov_);
-    RCLCPP_INFO(this->get_logger(), "  Detecting colors: red, green, blue, yellow, orange, purple");
+    RCLCPP_INFO(this->get_logger(), "  Detecting colors: red, green, blue, cyan, orange, yellow, purple");
     RCLCPP_INFO(this->get_logger(), "========================================");
 }
 
@@ -107,9 +107,9 @@ void BallPerceptionNode::initialize_color_ranges()
     // Range 2: High red (160-179)
     ColorRange red;
     red.name = "red";
-    red.lower1 = cv::Scalar(0, 100, 100);
+    red.lower1 = cv::Scalar(0, 70, 50);
     red.upper1 = cv::Scalar(10, 255, 255);
-    red.lower2 = cv::Scalar(160, 100, 100);
+    red.lower2 = cv::Scalar(160, 70, 50);
     red.upper2 = cv::Scalar(179, 255, 255);
     red.has_secondary = true;
     color_ranges_.push_back(red);
@@ -137,6 +137,14 @@ void BallPerceptionNode::initialize_color_ranges()
     cyan.upper1 = cv::Scalar(100, 255, 255);
     cyan.has_secondary = false;
     color_ranges_.push_back(cyan);
+
+    // ORANGE - between red and yellow
+    ColorRange orange;
+    orange.name = "orange";
+    orange.lower1 = cv::Scalar(11, 70, 50);
+    orange.upper1 = cv::Scalar(21, 255, 255);
+    orange.has_secondary = false;
+    color_ranges_.push_back(orange);
 
     // YELLOW - starts after orange range
     ColorRange yellow;

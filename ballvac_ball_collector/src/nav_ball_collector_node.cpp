@@ -46,7 +46,7 @@ NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
     this->declare_parameter<std::string>("detection_topic", "/ball_detections");
     detection_topic_ = this->get_parameter("detection_topic").as_string();
     
-    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel");
+    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel_in");
     cmd_topic_ = this->get_parameter("cmd_topic").as_string();
     
     this->declare_parameter<std::string>("odom_topic", "/odom");
@@ -278,6 +278,10 @@ NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
         robot_status_pub_ = this->create_publisher<ballvac_msgs::msg::RobotStatus>(
             robot_status_topic_,
             rclcpp::QoS(50).reliable());
+
+        fleet_ball_pos_pub_ = this->create_publisher<ballvac_msgs::msg::BallDetectionArray>(
+            "/fleet/ball_positions",
+            rclcpp::SensorDataQoS());
         
         // Heartbeat timer - publish status every 2 seconds
         heartbeat_timer_ = this->create_wall_timer(
@@ -612,6 +616,38 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
     {
         return;
     }
+
+    if (use_fleet_coordinator_ && fleet_ball_pos_pub_ && latest_odom_)
+    {
+        ballvac_msgs::msg::BallDetectionArray fleet_msg;
+        fleet_msg.header.stamp = this->now();
+        fleet_msg.header.frame_id = map_frame_;
+
+        for (const auto & det : msg->detections)
+        {
+            if (det.name.empty())
+            {
+                continue;
+            }
+
+            if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
+            {
+                continue;
+            }
+
+            auto pose = estimate_ball_world_pose(det);
+            auto det_out = det;
+            det_out.header = fleet_msg.header;
+            det_out.center_x = static_cast<int>(std::lround(pose.pose.position.x * 1000.0));
+            det_out.center_y = static_cast<int>(std::lround(pose.pose.position.y * 1000.0));
+            fleet_msg.detections.push_back(det_out);
+        }
+
+        if (!fleet_msg.detections.empty())
+        {
+            fleet_ball_pos_pub_->publish(fleet_msg);
+        }
+    }
     
     // ==========================================================================
     // Fleet coordination mode: only pursue assigned balls
@@ -622,6 +658,51 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
         if (current_state_ == NavCollectorState::IDLE || 
             current_state_ == NavCollectorState::EXPLORING)
         {
+            if (!has_active_assignment_)
+            {
+                // Fallback: no assignment yet, pursue best visible ball locally
+                const ballvac_msgs::msg::BallDetection * best_ball = nullptr;
+                float best_size = 0.0f;
+                
+                for (const auto & det : msg->detections)
+                {
+                    if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
+                    {
+                        continue;
+                    }
+                    
+                    if (is_ball_claimed_by_other(det.name))
+                    {
+                        continue;
+                    }
+                    
+                    if (det.apparent_size > best_size)
+                    {
+                        best_size = det.apparent_size;
+                        best_ball = &det;
+                    }
+                }
+                
+                if (best_ball != nullptr)
+                {
+                    target_ball_.valid = true;
+                    target_ball_.name = best_ball->name;
+                    target_ball_.color = best_ball->color;
+                    target_ball_.bearing = best_ball->bearing;
+                    target_ball_.apparent_size = best_ball->apparent_size;
+                    target_ball_.last_seen = this->now();
+                    
+                    target_ball_.world_pose = estimate_ball_world_pose(*best_ball);
+                    target_ball_.position_known = true;
+                    target_ball_.estimated_distance = estimate_distance_from_size(best_ball->apparent_size);
+                    
+                    RCLCPP_INFO(this->get_logger(), 
+                        "No assignment yet - locally pursuing '%s' (bearing=%.2f, size=%.1f)",
+                        best_ball->name.c_str(), best_ball->bearing, best_ball->apparent_size);
+                    
+                    transition_to(NavCollectorState::APPROACHING);
+                }
+            }
             return;
         }
         
@@ -629,7 +710,7 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
         if (current_state_ == NavCollectorState::NAVIGATING || 
             current_state_ == NavCollectorState::APPROACHING)
         {
-            if (!has_active_assignment_ || !target_ball_.valid)
+            if (!target_ball_.valid)
             {
                 return;
             }
@@ -652,6 +733,7 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
             bool found_target = false;
             const ballvac_msgs::msg::BallDetection * best_det = nullptr;
             double best_score = std::numeric_limits<double>::max();
+            bool matched_by_name = false;
             for (const auto & det : msg->detections)
             {
                 // Match by exact name first, otherwise by color
@@ -664,6 +746,7 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
                 {
                     best_det = &det;
                     best_score = 0.0;
+                    matched_by_name = true;
                     break;
                 }
                 
@@ -686,7 +769,10 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
                 target_ball_.last_seen = this->now();
                 target_ball_.estimated_distance = estimate_distance_from_size(best_det->apparent_size);
                 target_ball_.world_pose = estimate_ball_world_pose(*best_det);
-                target_ball_.name = best_det->name;  // Update name in case it changed
+                if (matched_by_name)
+                {
+                    target_ball_.name = best_det->name;
+                }
                 
                 RCLCPP_DEBUG(this->get_logger(), 
                     "Tracking assigned '%s': bearing=%.2f, size=%.1f, dist=%.2fm",
@@ -734,7 +820,10 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
                     RCLCPP_WARN(this->get_logger(), 
                         "Target '%s' lost for %.1f seconds - reporting to coordinator",
                         target_ball_.name.c_str(), time_since_seen);
-                    publish_lost(target_ball_.name);
+                    if (has_active_assignment_)
+                    {
+                        publish_lost(target_ball_.name);
+                    }
                     target_ball_.valid = false;
                     cancel_navigation();
                     transition_to(NavCollectorState::EXPLORING);
@@ -827,6 +916,7 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
         // Look for our target ball
         const ballvac_msgs::msg::BallDetection * best_det = nullptr;
         double best_score = std::numeric_limits<double>::max();
+        bool matched_by_name = false;
         for (const auto & det : msg->detections)
         {
             if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
@@ -838,6 +928,7 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
             {
                 best_det = &det;
                 best_score = 0.0;
+                matched_by_name = true;
                 break;
             }
             
@@ -862,6 +953,10 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
             
             // Update world pose
             target_ball_.world_pose = estimate_ball_world_pose(*best_det);
+            if (matched_by_name)
+            {
+                target_ball_.name = best_det->name;
+            }
             
             RCLCPP_DEBUG(this->get_logger(), 
                 "Tracking '%s': bearing=%.2f, size=%.1f, dist=%.2fm",
@@ -1249,6 +1344,8 @@ void NavBallCollectorNode::execute_navigating()
             "NAVIGATING: Target temporarily lost (%.1fs), continuing to last known position",
             time_since_seen);
     }
+
+    bool ball_visible = time_since_seen <= ball_visible_timeout_;
     
     // If navigation is not in progress, send goal to ball position
     if (!navigation_in_progress_ && target_ball_.position_known)
@@ -1256,10 +1353,26 @@ void NavBallCollectorNode::execute_navigating()
         // If Nav2 is not ready, skip to APPROACHING mode directly
         if (!nav2_ready_)
         {
-            RCLCPP_INFO(this->get_logger(), 
-                "NAVIGATING: Nav2 not ready, switching to direct APPROACHING");
-            transition_to(NavCollectorState::APPROACHING);
-            return;
+            if (nav_to_pose_client_->wait_for_action_server(std::chrono::milliseconds(0)))
+            {
+                nav2_ready_ = true;
+                explore_with_nav2_ = true;
+            }
+            else
+            {
+                if (ball_visible)
+                {
+                    RCLCPP_INFO(this->get_logger(),
+                        "NAVIGATING: Nav2 not ready, switching to direct APPROACHING");
+                    transition_to(NavCollectorState::APPROACHING);
+                }
+                else
+                {
+                    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "NAVIGATING: Nav2 not ready and target not visible; waiting for Nav2");
+                }
+                return;
+            }
         }
         
         // Check if ball is near a wall - need special approach

@@ -45,7 +45,7 @@ def generate_launch_description():
     
     cmd_topic_arg = DeclareLaunchArgument(
         'cmd_topic',
-        default_value='/cmd_vel',
+        default_value='/cmd_vel_in',
         description='Velocity command topic'
     )
     
@@ -158,6 +158,20 @@ def generate_launch_description():
     )
     
     # ==========================================================================
+    # Motion Controller Node
+    # ==========================================================================
+    motion_controller_node = Node(
+        package='ballvac_control',
+        executable='motion_controller_node',
+        name='motion_controller_node',
+        output='screen',
+        parameters=[{
+            'input_topic': '/cmd_vel_in',
+            'output_topic': '/cmd_vel',
+        }]
+    )
+
+    # ==========================================================================
     # Ball Collector Node
     # ==========================================================================
     ball_collector_node = Node(
@@ -223,5 +237,6 @@ def generate_launch_description():
         
         # Nodes
         ball_perception_node,
+        motion_controller_node,
         ball_collector_node,
     ])

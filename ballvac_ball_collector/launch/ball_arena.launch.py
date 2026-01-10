@@ -148,7 +148,7 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': True,
             'scan_topic': '/scan',
-            'cmd_topic': '/cmd_vel',
+            'cmd_topic': '/cmd_vel_in',
             'detection_topic': '/ball_detections',
             'delete_service': '/world/ball_arena/remove',
             'spawn_service': '/world/ball_arena/create',
@@ -161,6 +161,20 @@ def generate_launch_description():
             'min_ball_radius': 25.0,
             'max_ball_radius': 160.0,
             'collection_cooldown': 2.0,
+        }]
+    )
+
+    # =========================================================================
+    # Motion Controller Node
+    # =========================================================================
+    motion_controller = Node(
+        package='ballvac_control',
+        executable='motion_controller_node',
+        name='motion_controller_node',
+        output='screen',
+        parameters=[{
+            'input_topic': '/cmd_vel_in',
+            'output_topic': '/cmd_vel',
         }]
     )
     
@@ -231,6 +245,6 @@ def generate_launch_description():
         # Ball handling (delayed to let simulation start)
         TimerAction(
             period=5.0,
-            actions=[ball_perception, ball_launcher, ball_collector]
+            actions=[ball_perception, ball_launcher, motion_controller, ball_collector]
         ),
     ])

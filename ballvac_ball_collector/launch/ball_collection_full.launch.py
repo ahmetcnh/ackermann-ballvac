@@ -342,7 +342,7 @@ def generate_launch_description():
             # Topics
             'scan_topic': '/scan',
             'detection_topic': '/ball_detections',
-            'cmd_topic': '/cmd_vel',
+            'cmd_topic': '/cmd_vel_in',
             'odom_topic': '/odom',
             # Services
             'delete_service': '/world/ball_arena/remove',
@@ -379,6 +379,20 @@ def generate_launch_description():
             'recover_duration': 1.5,
             'recover_speed': 0.6,
         }],
+    )
+
+    # =========================================================================
+    # 9.5 Motion Controller Node
+    # =========================================================================
+    motion_controller = Node(
+        package='ballvac_control',
+        executable='motion_controller_node',
+        name='motion_controller_node',
+        output='screen',
+        parameters=[{
+            'input_topic': '/cmd_vel_in',
+            'output_topic': '/cmd_vel',
+        }]
     )
     
     # =========================================================================
@@ -447,7 +461,7 @@ def generate_launch_description():
         # Stage 7: Ball collector (10s delay - wait for everything)
         TimerAction(
             period=10.0,
-            actions=[nav_ball_collector]
+            actions=[motion_controller, nav_ball_collector]
         ),
         
         # Stage 8: RViz (2s delay)

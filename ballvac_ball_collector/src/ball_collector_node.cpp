@@ -8,7 +8,7 @@
  * - COLLECT: When close enough, calls DeleteEntity service to remove ball from Gazebo
  * - RECOVER: Backs up and turns when stuck or after collection failure
  * 
- * Control is done via geometry_msgs/Twist on /cmd_vel topic (Ackermann plugin).
+ * Control is done via geometry_msgs/Twist on /cmd_vel_in topic (Ackermann plugin).
  * Entity deletion uses ros_gz_interfaces/srv/DeleteEntity service.
  */
 
@@ -49,7 +49,7 @@ BallCollectorNode::BallCollectorNode(const rclcpp::NodeOptions & options)
     this->declare_parameter<std::string>("detection_topic", "/ball_detections");
     detection_topic_ = this->get_parameter("detection_topic").as_string();
     
-    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel");
+    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel_in");
     cmd_topic_ = this->get_parameter("cmd_topic").as_string();
     
     // Delete entity service - the world name should match the SDF world name

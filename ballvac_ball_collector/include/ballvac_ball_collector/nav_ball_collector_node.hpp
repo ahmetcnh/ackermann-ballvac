@@ -285,6 +285,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<ballvac_msgs::msg::RobotStatus>::SharedPtr robot_status_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ball_deleted_pub_;
+    rclcpp::Publisher<ballvac_msgs::msg::BallDetectionArray>::SharedPtr fleet_ball_pos_pub_;
     
     // Action client for Nav2
     rclcpp_action::Client<NavigateToPose>::SharedPtr nav_to_pose_client_;

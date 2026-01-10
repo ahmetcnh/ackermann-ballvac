@@ -116,6 +116,33 @@ def generate_robot_nav2_params(robot_name, nav2_params_path):
     return temp_params_path
 
 
+def parse_initial_balls(world_sdf_path):
+    """Parse ball model names and poses from a world SDF."""
+    entries = []
+    try:
+        with open(world_sdf_path, 'r') as f:
+            content = f.read()
+    except OSError:
+        return entries
+
+    pattern = re.compile(
+        r'<model\s+name="(ball_[^"]+)">.*?<pose>\s*([^<]+)\s*</pose>',
+        re.DOTALL
+    )
+    for match in pattern.finditer(content):
+        name = match.group(1)
+        pose_parts = match.group(2).strip().split()
+        if len(pose_parts) < 2:
+            continue
+        try:
+            x = float(pose_parts[0])
+            y = float(pose_parts[1])
+        except ValueError:
+            continue
+        entries.append(f"{name},{x:.3f},{y:.3f}")
+    return entries
+
+
 def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spawn_yaw, use_sim_time):
     """Generate all nodes for a single robot with proper namespacing."""
     
@@ -453,7 +480,8 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             ],
             remappings=[
                 *tf_remaps,
-                ('cmd_vel', f'/{robot_name}/cmd_vel'),
+                # Feed controller output into velocity_smoother input
+                ('cmd_vel', f'/{robot_name}/cmd_vel_nav'),
             ]
         ),
         
@@ -632,7 +660,23 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
     nodes.append(ball_perception)
     
     # =========================================================================
-    # 8. Nav Ball Collector Node (Modified for multi-robot)
+    # 8. Motion Controller (routes cmd_vel_in -> cmd_vel)
+    # =========================================================================
+    motion_controller = Node(
+        package='ballvac_control',
+        executable='motion_controller_node',
+        name='motion_controller_node',
+        namespace=robot_name,
+        output='screen',
+        parameters=[{
+            'input_topic': 'cmd_vel_in',
+            'output_topic': 'cmd_vel',
+        }]
+    )
+    nodes.append(motion_controller)
+
+    # =========================================================================
+    # 9. Nav Ball Collector Node (Modified for multi-robot)
     # =========================================================================
     nav_ball_collector = Node(
         package='ballvac_ball_collector',
@@ -644,11 +688,11 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             'use_sim_time': True,
             # Robot identification
             'robot_id': robot_name,
-            'use_fleet_coordinator': False,
+            'use_fleet_coordinator': True,
             # Topics (namespaced)
             'scan_topic': f'/{robot_name}/scan',
             'detection_topic': f'/{robot_name}/ball_detections',
-            'cmd_topic': f'/{robot_name}/cmd_vel',
+            'cmd_topic': f'/{robot_name}/cmd_vel_in',
             'odom_topic': f'/{robot_name}/odom',
             # Fleet topics
             'assignment_topic': f'/{robot_name}/assignment',
@@ -662,7 +706,7 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             'camera_frame': camera_frame,
             # Navigation parameters
             'nav_to_approach_distance': 0.7,   # Get closer before reactive control
-            'collect_distance_m': 0.35,
+            'collect_distance_m': 0.45,        # Trigger collection a bit earlier
             # Speed and steering - FAST MOVEMENT
             'approach_speed': 1.8,             # FAST!
             'obstacle_stop_m': 0.7,            # Wall stop distance
@@ -672,12 +716,16 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             'control_rate': 30.0,              # Fast control loop
             'steering_gain': 4.0,              # Responsive steering
             # Ball detection parameters
-            'approach_radius_threshold': 90.0,   # Ball pixel size to trigger collection (larger = closer)
+            'approach_radius_threshold': 80.0,   # Ball pixel size to trigger collection (larger = closer)
             'min_ball_radius': 8.0,              # Detect smaller balls further away
             'max_ball_radius': 250.0,
             'collection_cooldown': 0.3,        # Faster cooldown
             'target_lost_timeout': 15.0,       # INCREASED: Don't cancel navigation too quickly
             'ball_visible_timeout': 1.0,       # INCREASED: More tolerance
+            # Camera/ball calibration (match model.sdf)
+            'camera_fov_horizontal': 1.658,
+            'camera_resolution_width': 720.0,
+            'ball_actual_diameter': 0.20,
             # Exploration bounds - STAY AWAY FROM WALLS
             'exploration_min_x': -7.0,         # Reduced bounds
             'exploration_max_x': 7.0,
@@ -712,6 +760,7 @@ def generate_launch_description():
     # =========================================================================
     world_sdf = os.path.join(pkg_ballvac_description, 'worlds', 'ball_arena.sdf')
     rviz_config = os.path.join(pkg_ballvac_bringup, 'rviz', 'navigation.rviz')
+    initial_balls = parse_initial_balls(world_sdf)
     
     # =========================================================================
     # Launch arguments
@@ -845,6 +894,7 @@ def generate_launch_description():
             'map_bounds_max_y': 10.0,
             'wall_safety_margin': 1.5,        # Stay away from walls
             'robot_conflict_radius': 2.0,     # Don't target same balls
+            'initial_balls': initial_balls,
         }]
     )
     

@@ -458,7 +458,7 @@
     <!-- Red Ball 2 -->
     <model name="ball_red_2">
       <static>false</static>
-      <pose>-1.5 -1.0 0.1 0 0 0</pose>
+      <pose>-3.0 0.5 0.1 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.1</mass>
@@ -518,7 +518,7 @@
     <!-- Green Ball 2 -->
     <model name="ball_green_2">
       <static>false</static>
-      <pose>-3.0 2.5 0.1 0 0 0</pose>
+      <pose>0.5 2.5 0.1 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.1</mass>
@@ -578,7 +578,7 @@
     <!-- Blue Ball 2 -->
     <model name="ball_blue_2">
       <static>false</static>
-      <pose>1.5 3.0 0.1 0 0 0</pose>
+      <pose>-1.5 -2.0 0.1 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.1</mass>
@@ -638,7 +638,7 @@
     <!-- Yellow Ball 2 -->
     <model name="ball_yellow_2">
       <static>false</static>
-      <pose>-2.5 -3.0 0.1 0 0 0</pose>
+      <pose>2.5 2.0 0.1 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.1</mass>

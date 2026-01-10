@@ -201,6 +201,24 @@ private:
      */
     double get_safe_approach_angle(const geometry_msgs::msg::PoseStamped & ball_pose,
                                    const geometry_msgs::msg::PoseStamped & robot_pose);
+
+    /**
+     * @brief Load initial ball registry entries from launch-provided strings.
+     */
+    void load_initial_balls(const std::vector<std::string> & entries);
+
+    /**
+     * @brief Extract color name from a ball model name like "ball_red_2".
+     */
+    std::string get_color_from_ball_id(const std::string & ball_id) const;
+
+    /**
+     * @brief Match a detection by color and proximity to an existing ball id.
+     */
+    std::string match_ball_by_color_and_distance(
+        const std::string & color,
+        const geometry_msgs::msg::PoseStamped & pose,
+        double max_distance_m) const;
     
     /**
      * @brief Publish current assignments to all robots

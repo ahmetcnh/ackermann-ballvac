@@ -41,7 +41,7 @@ ExplorationCollectorNode::ExplorationCollectorNode(const rclcpp::NodeOptions & o
     this->declare_parameter<std::string>("scan_topic", "/scan");
     this->declare_parameter<std::string>("map_topic", "/map");
     this->declare_parameter<std::string>("odom_topic", "/odom");
-    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel");
+    this->declare_parameter<std::string>("cmd_topic", "/cmd_vel_in");
     this->declare_parameter<std::string>("detection_topic", "/ball_detections");
     this->declare_parameter<std::string>("delete_service", "/world/ball_arena/remove");
     
@@ -358,6 +358,12 @@ void ExplorationCollectorNode::execute_collecting()
     }
     
     // Otherwise, continue moving to find balls
+    static int navigating_log_counter = 0;
+    if (++navigating_log_counter >= 40)  // Every ~2 seconds at 20Hz
+    {
+        navigating_log_counter = 0;
+        RCLCPP_INFO(this->get_logger(), "Navigating to search for balls");
+    }
     wall_follow();
 }
 
@@ -377,6 +383,15 @@ void ExplorationCollectorNode::execute_approaching()
         return;
     }
     
+    static int approaching_log_counter = 0;
+    if (++approaching_log_counter >= 20)  // Every ~1 second at 20Hz
+    {
+        approaching_log_counter = 0;
+        RCLCPP_INFO(this->get_logger(),
+            "Approaching ball: %s (bearing=%.2f size=%.1f)",
+            current_target_.color.c_str(), current_target_.bearing, current_target_.size);
+    }
+
     float linear_vel = collection_speed_;
     float angular_vel = -2.0f * current_target_.bearing;  // Proportional steering
     angular_vel = std::clamp(angular_vel, -static_cast<float>(max_steer_), 
@@ -653,6 +668,14 @@ void ExplorationCollectorNode::collect_ball()
     
     if (!current_target_.valid || delete_pending_)
     {
+        if (!current_target_.valid)
+        {
+            RCLCPP_WARN(this->get_logger(), "Cannot collect: no valid target");
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "Cannot collect: delete already pending");
+        }
         return;
     }
     
@@ -695,6 +718,12 @@ void ExplorationCollectorNode::delete_callback(
             RCLCPP_INFO(this->get_logger(), 
                 "Collected %s ball! Total: %d",
                 current_target_.color.c_str(), balls_collected_);
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "Failed to collect %s ball: delete service returned failure",
+                current_target_.color.c_str());
         }
     }
     catch (const std::exception & e)

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sstream>
 
 namespace ballvac_ball_collector
 {
@@ -76,6 +77,11 @@ FleetCoordinatorNode::FleetCoordinatorNode(const rclcpp::NodeOptions & options)
     this->declare_parameter<double>("robot_conflict_radius", 2.0);  // Robots shouldn't target same area
     robot_conflict_radius_ = this->get_parameter("robot_conflict_radius").as_double();
 
+    // Initial balls from world file (format: "ball_red_2,x,y")
+    this->declare_parameter<std::vector<std::string>>(
+        "initial_balls", std::vector<std::string>{});
+    auto initial_balls = this->get_parameter("initial_balls").as_string_array();
+
     // -------------------------------------------------------------------------
     // Create publishers with reliable QoS for coordination
     // -------------------------------------------------------------------------
@@ -102,6 +108,11 @@ FleetCoordinatorNode::FleetCoordinatorNode(const rclcpp::NodeOptions & options)
     {
         setup_robot(robot_id);
     }
+
+    // -------------------------------------------------------------------------
+    // Load initial ball registry entries from the world file
+    // -------------------------------------------------------------------------
+    load_initial_balls(initial_balls);
 
     // -------------------------------------------------------------------------
     // Subscribe to ball_launcher's ground truth positions
@@ -210,6 +221,18 @@ void FleetCoordinatorNode::ball_position_callback(
         // Update or add ball
         if (ball_registry_.count(det.name) == 0)
         {
+            // Try to match by color and proximity before registering a new id.
+            const double max_match_distance_m = 1.5;
+            std::string matched_id = match_ball_by_color_and_distance(
+                det.color, pose, max_match_distance_m);
+
+            if (!matched_id.empty())
+            {
+                ball_registry_[matched_id].pose = pose;
+                ball_registry_[matched_id].last_seen_time = this->now();
+                continue;
+            }
+
             // New ball - add to registry
             BallInfo ball;
             ball.ball_id = det.name;
@@ -457,6 +480,114 @@ void FleetCoordinatorNode::cleanup_timer_callback()
     {
         ball_registry_.erase(ball_id);
     }
+}
+
+void FleetCoordinatorNode::load_initial_balls(const std::vector<std::string> & entries)
+{
+    if (entries.empty())
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+
+    for (const auto & entry : entries)
+    {
+        std::stringstream ss(entry);
+        std::string ball_id;
+        std::string x_str;
+        std::string y_str;
+        if (!std::getline(ss, ball_id, ',') ||
+            !std::getline(ss, x_str, ',') ||
+            !std::getline(ss, y_str, ','))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "Invalid initial_balls entry: '%s' (expected ball_id,x,y)",
+                entry.c_str());
+            continue;
+        }
+
+        try
+        {
+            double ball_x = std::stod(x_str);
+            double ball_y = std::stod(y_str);
+
+            geometry_msgs::msg::PoseStamped pose;
+            pose.header.frame_id = "map";
+            pose.pose.position.x = ball_x;
+            pose.pose.position.y = ball_y;
+            pose.pose.position.z = 0.0;
+            pose.pose.orientation.w = 1.0;
+
+            BallInfo ball;
+            ball.ball_id = ball_id;
+            ball.color = get_color_from_ball_id(ball_id);
+            ball.pose = pose;
+            ball.state = ballvac_msgs::msg::BallState::UNCLAIMED;
+            ball.claimed_by_robot = "";
+            ball.last_seen_time = this->now();
+            ball.priority = get_color_priority(ball.color);
+            ball_registry_[ball_id] = ball;
+
+            RCLCPP_INFO(this->get_logger(),
+                "Loaded initial ball: %s (%s) at (%.2f, %.2f)",
+                ball_id.c_str(), ball.color.c_str(), ball_x, ball_y);
+        }
+        catch (const std::exception &)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "Invalid initial_balls entry: '%s' (x/y parse failed)",
+                entry.c_str());
+        }
+    }
+}
+
+std::string FleetCoordinatorNode::get_color_from_ball_id(const std::string & ball_id) const
+{
+    const std::string prefix = "ball_";
+    std::string color = ball_id;
+    if (color.rfind(prefix, 0) == 0)
+    {
+        color = color.substr(prefix.size());
+    }
+    auto underscore = color.find('_');
+    if (underscore != std::string::npos)
+    {
+        color = color.substr(0, underscore);
+    }
+    return color;
+}
+
+std::string FleetCoordinatorNode::match_ball_by_color_and_distance(
+    const std::string & color,
+    const geometry_msgs::msg::PoseStamped & pose,
+    double max_distance_m) const
+{
+    std::string best_id;
+    double best_dist = std::numeric_limits<double>::max();
+
+    for (const auto & [ball_id, ball] : ball_registry_)
+    {
+        if (ball.color != color || ball.state == ballvac_msgs::msg::BallState::COLLECTED)
+        {
+            continue;
+        }
+
+        double dx = ball.pose.pose.position.x - pose.pose.position.x;
+        double dy = ball.pose.pose.position.y - pose.pose.position.y;
+        double dist = std::hypot(dx, dy);
+        if (dist < best_dist)
+        {
+            best_dist = dist;
+            best_id = ball_id;
+        }
+    }
+
+    if (!best_id.empty() && best_dist <= max_distance_m)
+    {
+        return best_id;
+    }
+    return "";
 }
 
 uint8_t FleetCoordinatorNode::get_color_priority(const std::string & color)

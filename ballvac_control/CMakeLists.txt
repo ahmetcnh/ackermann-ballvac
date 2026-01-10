@@ -31,10 +31,14 @@ ament_target_dependencies(main rclcpp ballvac_msgs sensor_msgs)
 add_executable(client src/client.cpp)
 ament_target_dependencies(client rclcpp ballvac_msgs )
 
+add_executable(motion_controller_node src/motion_controller_node.cpp)
+ament_target_dependencies(motion_controller_node rclcpp geometry_msgs)
+
 install(
   TARGETS 
   main 
   client
+  motion_controller_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
