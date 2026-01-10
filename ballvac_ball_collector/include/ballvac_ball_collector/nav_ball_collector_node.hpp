@@ -128,6 +128,7 @@ private:
     void ball_registry_callback(const ballvac_msgs::msg::BallRegistry::SharedPtr msg);
     void heartbeat_timer_callback();
     void deleted_ball_callback(const std_msgs::msg::String::SharedPtr msg);
+    void ball_claimed_callback(const std_msgs::msg::String::SharedPtr msg);  // Handle other robots' claims
     void pose_log_timer_callback();
     void control_loop();
     
@@ -268,6 +269,40 @@ private:
     void get_random_spawn_position(double & x, double & y);
     std::string get_entity_name(const std::string & color);
     double estimate_distance_from_size(double apparent_size);
+    
+    // =========================================================================
+    // NEW: Coverage-based exploration helpers
+    // =========================================================================
+    
+    /**
+     * @brief Update visited cells grid based on current position
+     */
+    void update_visited_cells();
+    
+    /**
+     * @brief Get color priority value (lower = higher priority)
+     */
+    int get_color_priority(const std::string & color);
+    
+    /**
+     * @brief Check if detected ball has higher priority than current target
+     */
+    bool is_higher_priority(const std::string & new_color, const std::string & current_color);
+    
+    /**
+     * @brief Callback for other robot odometry (for avoidance)
+     */
+    void other_robot_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg, const std::string & robot_name);
+    
+    /**
+     * @brief Check distance to other robots, return repulsive steering if needed
+     */
+    float compute_robot_avoidance_steering();
+    
+    /**
+     * @brief Execute escape maneuver when stuck
+     */
+    void execute_escape_maneuver();
 
     // =========================================================================
     // ROS 2 Communication
@@ -285,6 +320,8 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<ballvac_msgs::msg::RobotStatus>::SharedPtr robot_status_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ball_deleted_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ball_claimed_pub_;  // Publish when claiming a ball
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr ball_claimed_sub_;  // Track other robots' claims
     rclcpp::Publisher<ballvac_msgs::msg::BallDetectionArray>::SharedPtr fleet_ball_pos_pub_;
     
     // Action client for Nav2
@@ -451,6 +488,32 @@ private:
     
     // Thread safety
     std::mutex state_mutex_;
+    
+    // =========================================================================
+    // NEW: Coverage-based exploration
+    // =========================================================================
+    static constexpr double COVERAGE_CELL_SIZE = 1.0;  // 1m cells
+    std::map<std::pair<int,int>, int> visited_cells_;  // (x_cell, y_cell) -> visit_count
+    
+    // =========================================================================
+    // NEW: Color priority for target selection (lower = higher priority)
+    // =========================================================================
+    std::map<std::string, int> color_priority_;
+    
+    // =========================================================================
+    // NEW: Robot-robot avoidance
+    // =========================================================================
+    std::map<std::string, geometry_msgs::msg::Pose> other_robot_poses_;
+    std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> other_robot_odom_subs_;
+    double robot_avoid_radius_;
+    std::vector<std::string> other_robot_names_;
+    
+    // =========================================================================
+    // NEW: Never-stuck watchdog
+    // =========================================================================
+    rclcpp::Time last_movement_time_;
+    double stall_timeout_;
+    double velocity_threshold_;
 };
 
 }  // namespace ballvac_ball_collector

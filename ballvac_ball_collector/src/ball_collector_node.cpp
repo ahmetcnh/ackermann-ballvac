@@ -644,7 +644,8 @@ void BallCollectorNode::execute_collect()
     }
     
     // Get entity name and attempt deletion
-    std::string entity_name = get_entity_name(target_ball_.color);
+    // Use the specific ball name (ID) from detection instead of constructing from color
+    std::string entity_name = target_ball_.name;
     
     RCLCPP_INFO(this->get_logger(), 
         "COLLECT: Attempting to delete entity '%s'", entity_name.c_str());

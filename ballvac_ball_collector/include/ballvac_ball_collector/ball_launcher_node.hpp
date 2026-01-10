@@ -68,6 +68,11 @@ private:
     void launch_ball();
     
     /**
+     * @brief Spawn initial balls at random positions across the arena
+     */
+    void spawn_initial_balls();
+    
+    /**
      * @brief Generate SDF for a ball with initial velocity
      * @param color Ball color name
      * @param vx Initial X velocity
@@ -101,6 +106,7 @@ private:
     rclcpp::Publisher<ballvac_msgs::msg::BallDetectionArray>::SharedPtr ball_detection_pub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr ball_deleted_sub_;
     rclcpp::TimerBase::SharedPtr launch_timer_;
+    rclcpp::TimerBase::SharedPtr initial_spawn_timer_;  // Timer for initial ball spawning
     
     // =========================================================================
     // Parameters

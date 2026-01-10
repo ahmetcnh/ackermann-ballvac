@@ -235,6 +235,38 @@ NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
     last_escape_direction_ = 0.0f;
     blocked_directions_.clear();
     blocked_directions_clear_time_ = this->now();
+    
+    // -------------------------------------------------------------------------
+    // Initialize color priority (lower = higher priority)
+    // -------------------------------------------------------------------------
+    color_priority_["red"] = 0;
+    color_priority_["blue"] = 1;
+    color_priority_["green"] = 2;
+    color_priority_["yellow"] = 3;
+    color_priority_["orange"] = 4;
+    color_priority_["purple"] = 5;
+    color_priority_["cyan"] = 6;
+    
+    // -------------------------------------------------------------------------
+    // Initialize robot-robot avoidance
+    // -------------------------------------------------------------------------
+    robot_avoid_radius_ = 1.0;  // meters
+    // Determine other robot names based on our robot_id
+    std::vector<std::string> all_robots = {"ballvac1", "ballvac2", "ballvac3"};
+    for (const auto & name : all_robots)
+    {
+        if (name != robot_id_)
+        {
+            other_robot_names_.push_back(name);
+        }
+    }
+    
+    // -------------------------------------------------------------------------
+    // Initialize watchdog
+    // -------------------------------------------------------------------------
+    last_movement_time_ = this->now();
+    stall_timeout_ = 1.5;  // seconds
+    velocity_threshold_ = 0.05;  // m/s
 
     // -------------------------------------------------------------------------
     // Create ROS 2 communication
@@ -300,6 +332,22 @@ NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
     // Service clients
     delete_client_ = this->create_client<ros_gz_interfaces::srv::DeleteEntity>(delete_service_);
     spawn_client_ = this->create_client<ros_gz_interfaces::srv::SpawnEntity>(spawn_service_);
+    
+    // -------------------------------------------------------------------------
+    // Subscribe to other robots' odometry for robot-robot avoidance
+    // -------------------------------------------------------------------------
+    for (const auto & other_robot : other_robot_names_)
+    {
+        std::string odom_topic = "/" + other_robot + "/odom";
+        auto sub = this->create_subscription<nav_msgs::msg::Odometry>(
+            odom_topic,
+            10,
+            [this, other_robot](const nav_msgs::msg::Odometry::SharedPtr msg) {
+                this->other_robot_odom_callback(msg, other_robot);
+            });
+        other_robot_odom_subs_.push_back(sub);
+        RCLCPP_INFO(this->get_logger(), "Subscribed to %s for robot avoidance", odom_topic.c_str());
+    }
 
     // -------------------------------------------------------------------------
     // Create control loop timer
@@ -985,6 +1033,154 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
             }
         }
     }
+    // ==========================================================================
+    // STANDALONE MODE: Independent ball pursuit with priority-based selection
+    // ==========================================================================
+    else
+    {
+        // Find the best ball to pursue based on color priority
+        const ballvac_msgs::msg::BallDetection * best_ball = nullptr;
+        int best_priority = 999;
+        float best_score = -1.0f;  // Composite score: priority + size + alignment
+        
+        for (const auto & det : msg->detections)
+        {
+            if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
+            {
+                continue;
+            }
+            
+            // Skip already collected balls
+            if (collected_balls_.count(det.name) > 0)
+            {
+                continue;
+            }
+            
+            int priority = get_color_priority(det.color);
+            
+            // Score = priority (inverted, lower is better) + size bonus + alignment bonus
+            float size_bonus = det.apparent_size / 100.0f;
+            float alignment_bonus = (1.0f - std::abs(det.bearing) / M_PI) * 0.5f;
+            float score = (10 - priority) + size_bonus + alignment_bonus;
+            
+            if (priority < best_priority || 
+                (priority == best_priority && score > best_score))
+            {
+                best_priority = priority;
+                best_score = score;
+                best_ball = &det;
+            }
+        }
+        
+        // No valid ball found
+        if (best_ball == nullptr)
+        {
+            return;
+        }
+        
+        // ======================================================================
+        // State: IDLE or EXPLORING - Start pursuing the best ball
+        // ======================================================================
+        if (current_state_ == NavCollectorState::IDLE || 
+            current_state_ == NavCollectorState::EXPLORING)
+        {
+            target_ball_.valid = true;
+            target_ball_.name = best_ball->name;
+            target_ball_.color = best_ball->color;
+            target_ball_.bearing = best_ball->bearing;
+            target_ball_.apparent_size = best_ball->apparent_size;
+            target_ball_.last_seen = this->now();
+            target_ball_.world_pose = estimate_ball_world_pose(*best_ball);
+            target_ball_.position_known = true;
+            target_ball_.estimated_distance = estimate_distance_from_size(best_ball->apparent_size);
+            
+            RCLCPP_INFO(this->get_logger(), 
+                "Targeting '%s' (%s, priority=%d) at bearing=%.2f, size=%.1f, dist=%.2fm",
+                best_ball->name.c_str(), best_ball->color.c_str(), best_priority,
+                best_ball->bearing, best_ball->apparent_size, target_ball_.estimated_distance);
+            
+            cancel_navigation();
+            transition_to(NavCollectorState::APPROACHING);
+            return;
+        }
+        
+        // ======================================================================
+        // State: NAVIGATING or APPROACHING - Check for higher priority target
+        // ======================================================================
+        if (current_state_ == NavCollectorState::NAVIGATING || 
+            current_state_ == NavCollectorState::APPROACHING)
+        {
+            // Check if we should switch to a higher priority ball
+            if (target_ball_.valid && is_higher_priority(best_ball->color, target_ball_.color))
+            {
+                RCLCPP_INFO(this->get_logger(), 
+                    "Higher priority ball detected (%s > %s) - switching target!",
+                    best_ball->color.c_str(), target_ball_.color.c_str());
+                
+                target_ball_.name = best_ball->name;
+                target_ball_.color = best_ball->color;
+                target_ball_.bearing = best_ball->bearing;
+                target_ball_.apparent_size = best_ball->apparent_size;
+                target_ball_.last_seen = this->now();
+                target_ball_.world_pose = estimate_ball_world_pose(*best_ball);
+                target_ball_.position_known = true;
+                target_ball_.estimated_distance = estimate_distance_from_size(best_ball->apparent_size);
+                
+                cancel_navigation();
+                transition_to(NavCollectorState::APPROACHING);
+                return;
+            }
+            
+            // Update tracking of current target (find matching ball)
+            const ballvac_msgs::msg::BallDetection * tracking_det = nullptr;
+            double best_match_score = std::numeric_limits<double>::max();
+            
+            for (const auto & det : msg->detections)
+            {
+                if (det.apparent_size < min_ball_radius_ || det.apparent_size > max_ball_radius_)
+                {
+                    continue;
+                }
+                
+                // Match by name first
+                if (det.name == target_ball_.name)
+                {
+                    tracking_det = &det;
+                    break;
+                }
+                
+                // Match by color and bearing
+                if (det.color == target_ball_.color)
+                {
+                    double score = std::abs(det.bearing - target_ball_.bearing);
+                    if (score < best_match_score)
+                    {
+                        best_match_score = score;
+                        tracking_det = &det;
+                    }
+                }
+            }
+            
+            if (tracking_det)
+            {
+                target_ball_.bearing = tracking_det->bearing;
+                target_ball_.apparent_size = tracking_det->apparent_size;
+                target_ball_.last_seen = this->now();
+                target_ball_.estimated_distance = estimate_distance_from_size(tracking_det->apparent_size);
+                target_ball_.world_pose = estimate_ball_world_pose(*tracking_det);
+                
+                // Check if close enough to collect
+                if (tracking_det->apparent_size > approach_radius_threshold_)
+                {
+                    RCLCPP_INFO(this->get_logger(), 
+                        "Ball '%s' radius %.1f > threshold %.1f - COLLECTING",
+                        target_ball_.name.c_str(), tracking_det->apparent_size, approach_radius_threshold_);
+                    cancel_navigation();
+                    transition_to(NavCollectorState::COLLECTING);
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -994,6 +1190,39 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
 void NavBallCollectorNode::control_loop()
 {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    // =========================================================================
+    // NEW: Update coverage tracking
+    // =========================================================================
+    update_visited_cells();
+    
+    // =========================================================================
+    // NEW: Never-stuck watchdog - check if robot is stalled
+    // =========================================================================
+    if (current_state_ != NavCollectorState::COLLECTING &&
+        current_state_ != NavCollectorState::IDLE &&
+        current_state_ != NavCollectorState::RECOVERING &&
+        latest_odom_)
+    {
+        double linear_vel = std::abs(latest_odom_->twist.twist.linear.x);
+        if (linear_vel < velocity_threshold_)
+        {
+            double stall_time = (this->now() - last_movement_time_).seconds();
+            if (stall_time > stall_timeout_)
+            {
+                RCLCPP_WARN(this->get_logger(), 
+                    "Watchdog: Stalled for %.1fs (vel=%.3f) - triggering escape",
+                    stall_time, linear_vel);
+                execute_escape_maneuver();
+                last_movement_time_ = this->now();
+                return;  // Skip normal state execution
+            }
+        }
+        else
+        {
+            last_movement_time_ = this->now();
+        }
+    }
     
     switch (current_state_)
     {
@@ -1517,8 +1746,9 @@ void NavBallCollectorNode::execute_approaching()
             angular_vel = -steering_gain_ * target_ball_.bearing;
         }
         
-        angular_vel = std::clamp(angular_vel, static_cast<float>(-max_steer_), 
-                                 static_cast<float>(max_steer_));
+        // IMPORTANT: Use lower angular velocity limit during approach to avoid spinning  
+        constexpr float MAX_APPROACH_STEER = 1.5f;
+        angular_vel = std::clamp(angular_vel, -MAX_APPROACH_STEER, MAX_APPROACH_STEER);
         
         RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 500,
             "APPROACHING: Ball not visible (%.1fs). Avoiding walls, vel=(%.2f, %.2f)",
@@ -1560,10 +1790,11 @@ void NavBallCollectorNode::execute_approaching()
     // CRITICAL: Slow down to avoid pushing the ball!
     // =========================================================================
     
-    // Proportional steering towards ball
+    // Proportional steering towards ball (CAPPED to prevent spinning)
+    // IMPORTANT: Use lower angular velocity limit during approach to avoid spinning
+    constexpr float MAX_APPROACH_STEER = 1.5f;  // Limit steering to prevent spinning
     angular_vel = -steering_gain_ * target_ball_.bearing;
-    angular_vel = std::clamp(angular_vel, static_cast<float>(-max_steer_), 
-                             static_cast<float>(max_steer_));
+    angular_vel = std::clamp(angular_vel, -MAX_APPROACH_STEER, MAX_APPROACH_STEER);
     
     // Calculate speed based on distance to ball (from apparent size)
     // Larger apparent size = closer = slower speed
@@ -1629,6 +1860,33 @@ void NavBallCollectorNode::execute_collecting()
     // Camera saw ball close enough (apparent_size > threshold), so collect it
     if (!delete_pending_)
     {
+        // PRE-CHECK: Skip if ball was already collected by another robot
+        bool already_collected = false;
+        if (collected_balls_.count(target_ball_.name) > 0)
+        {
+            already_collected = true;
+        }
+        // Also check with _1, _2, _3, _4 suffixes
+        for (int i = 1; i <= 4 && !already_collected; i++)
+        {
+            std::string variant = target_ball_.name + "_" + std::to_string(i);
+            if (collected_balls_.count(variant) > 0)
+            {
+                already_collected = true;
+            }
+        }
+        
+        if (already_collected)
+        {
+            RCLCPP_INFO(this->get_logger(), 
+                "COLLECTING: Ball '%s' already collected by another robot - skipping", 
+                target_ball_.name.c_str());
+            target_ball_.valid = false;
+            delete_pending_ = false;
+            transition_to(NavCollectorState::EXPLORING);
+            return;
+        }
+        
         RCLCPP_INFO(this->get_logger(), 
             "COLLECTING: Deleting ball '%s' (size was %.1f)", 
             target_ball_.name.c_str(), target_ball_.apparent_size);
@@ -2740,36 +2998,168 @@ void NavBallCollectorNode::publish_cmd_vel(float linear, float angular)
 
 void NavBallCollectorNode::delete_entity(const std::string & entity_name)
 {
-    if (!delete_client_->wait_for_service(std::chrono::seconds(1)))
-    {
-        RCLCPP_WARN(this->get_logger(), "Delete service not available");
-        delete_pending_ = false;
-        transition_to(NavCollectorState::RECOVERING);
-        return;
-    }
-    
     // Store the base entity name and determine the name to try
+    // Entity names are: ball_color_1, ball_color_2, etc.
+    // We need to convert "ball_red" to "ball_red_1", "ball_red_2", etc.
     std::string name_to_try;
-    if (delete_attempt_ == 0)
+    
+    // Extract base name (could be "ball_red" or already have suffix)
+    std::string base_name = entity_name;
+    if (base_name.find('_') != std::string::npos)
     {
-        name_to_try = entity_name;
+        // Check if it already ends with a number (e.g., ball_red_1)
+        size_t last_underscore = base_name.rfind('_');
+        std::string suffix = base_name.substr(last_underscore + 1);
+        bool has_number = !suffix.empty() && std::all_of(suffix.begin(), suffix.end(), ::isdigit);
+        if (!has_number)
+        {
+            // No number suffix, add one based on attempt
+            name_to_try = base_name + "_" + std::to_string(delete_attempt_ + 1);
+        }
+        else
+        {
+            // Already has number, use as-is for first attempt
+            name_to_try = base_name;
+        }
     }
     else
     {
-        // Try with _2 suffix
-        name_to_try = entity_name + "_2";
+        // Simple name like "ball_red" - append attempt number
+        name_to_try = base_name + "_" + std::to_string(delete_attempt_ + 1);
     }
     current_delete_name_ = name_to_try;
     
-    RCLCPP_INFO(this->get_logger(), "Attempting to delete entity: %s (attempt %d)", 
+    RCLCPP_INFO(this->get_logger(), "Attempting to delete entity: %s (attempt %d) via gz command", 
         name_to_try.c_str(), delete_attempt_ + 1);
     
-    auto request = std::make_shared<ros_gz_interfaces::srv::DeleteEntity::Request>();
-    request->entity.name = name_to_try;
-    request->entity.type = 2;  // MODEL type
+    // WORKAROUND: ros_gz_bridge DeleteEntity service ALWAYS returns success even when entity
+    // doesn't exist in Gazebo. Use direct gz service command instead.
+    // Extract world name from delete_service_ parameter (format: /world/WORLDNAME/remove)
+    std::string world_name = "ball_arena";  // Default
+    size_t world_start = delete_service_.find("/world/");
+    if (world_start != std::string::npos)
+    {
+        world_start += 7;  // Skip "/world/"
+        size_t world_end = delete_service_.find("/", world_start);
+        if (world_end != std::string::npos)
+        {
+            world_name = delete_service_.substr(world_start, world_end - world_start);
+        }
+    }
     
-    delete_client_->async_send_request(request,
-        std::bind(&NavBallCollectorNode::delete_entity_callback, this, std::placeholders::_1));
+    // Build gz command: gz service -s /world/WORLD/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 2000 --req 'name: "ENTITY_NAME" type: MODEL'
+    std::string cmd = "gz service -s /world/" + world_name + "/remove "
+                      "--reqtype gz.msgs.Entity --reptype gz.msgs.Boolean "
+                      "--timeout 2000 --req 'name: \"" + name_to_try + "\" type: MODEL' 2>&1";
+    
+    RCLCPP_DEBUG(this->get_logger(), "Running: %s", cmd.c_str());
+    
+    // Run command and capture output
+    std::array<char, 256> buffer;
+    std::string result;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (pipe)
+    {
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+        {
+            result += buffer.data();
+        }
+        int ret = pclose(pipe);
+        
+        // Check if successful - gz service returns "data: true" on success
+        bool success = (ret == 0 && result.find("data: true") != std::string::npos);
+        
+        // Simulate callback with result
+        if (success)
+        {
+            delete_attempt_ = 0;
+            delete_pending_ = false;
+            
+            RCLCPP_INFO(this->get_logger(), 
+                "Successfully collected ball '%s' (deleted: %s via gz command)!", 
+                target_ball_.name.c_str(), current_delete_name_.c_str());
+
+            // Publish deletion event for other robots (and optional respawn)
+            auto delete_msg = std_msgs::msg::String();
+            delete_msg.data = current_delete_name_;
+            ball_deleted_pub_->publish(delete_msg);
+            
+            // Notify fleet coordinator (if enabled)
+            if (use_fleet_coordinator_)
+            {
+                publish_collected(target_ball_.name);
+            }
+            
+            // Track collection
+            ball_collect_count_[target_ball_.color]++;
+            last_collection_time_ = this->now();
+            
+            RCLCPP_INFO(this->get_logger(), "  %s balls: %d", 
+                target_ball_.color.c_str(), ball_collect_count_[target_ball_.color]);
+            
+            int total = 0;
+            for (const auto & [color, count] : ball_collect_count_)
+            {
+                total += count;
+            }
+            RCLCPP_INFO(this->get_logger(), "Total collected: %d", total);
+            
+            // Optionally respawn ball
+            if (respawn_balls_)
+            {
+                spawn_ball_with_name(target_ball_.color, current_delete_name_);
+            }
+            
+            // Add to collected set
+            collected_balls_.insert(current_delete_name_);
+            
+            // Reset target and continue exploring
+            target_ball_.valid = false;
+            transition_to(NavCollectorState::EXPLORING);
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "gz command failed for '%s': %s", 
+                name_to_try.c_str(), result.c_str());
+            
+            // Try alternative name if first attempt failed
+            // Try up to 4 variants: _1, _2, _3, _4
+            if (delete_attempt_ < 3)
+            {
+                RCLCPP_WARN(this->get_logger(), 
+                    "Failed to delete '%s', trying alternative name (attempt %d/4)...", 
+                    current_delete_name_.c_str(), delete_attempt_ + 2);
+                delete_attempt_++;
+                delete_pending_ = true;
+                delete_entity(target_ball_.name);  // Try again with next variant
+            }
+            else
+            {
+                // All attempts failed - mark as collected anyway and move on
+                RCLCPP_WARN(this->get_logger(), 
+                    "Could not find ball entity to delete after 4 attempts - marking as collected anyway");
+                delete_attempt_ = 0;
+                delete_pending_ = false;
+                
+                ball_collect_count_[target_ball_.color]++;
+                last_collection_time_ = this->now();
+                
+                if (respawn_balls_)
+                {
+                    spawn_ball(target_ball_.color);
+                }
+                
+                target_ball_.valid = false;
+                transition_to(NavCollectorState::EXPLORING);
+            }
+        }
+    }
+    else
+    {
+        RCLCPP_ERROR(this->get_logger(), "Failed to run gz command");
+        delete_pending_ = false;
+        transition_to(NavCollectorState::RECOVERING);
+    }
 }
 
 void NavBallCollectorNode::delete_entity_callback(
@@ -2830,11 +3220,12 @@ void NavBallCollectorNode::delete_entity_callback(
         else
         {
             // Try alternative name if first attempt failed
-            if (delete_attempt_ < 1)
+            // Try up to 4 variants: _1, _2, _3, _4
+            if (delete_attempt_ < 3)
             {
                 RCLCPP_WARN(this->get_logger(), 
-                    "Failed to delete '%s', trying alternative name...", 
-                    current_delete_name_.c_str());
+                    "Failed to delete '%s', trying alternative name (attempt %d/4)...", 
+                    current_delete_name_.c_str(), delete_attempt_ + 2);
                 delete_attempt_++;
                 delete_pending_ = true;  // Keep pending
                 delete_entity(target_ball_.name);  // Try again with next variant
@@ -3125,6 +3516,131 @@ bool NavBallCollectorNode::is_approach_path_blocked()
     
     // If wall is close in front, approach is blocked
     return min_front < obstacle_stop_m_ * 1.5;
+}
+
+// =============================================================================
+// NEW: Coverage-based exploration helpers
+// =============================================================================
+
+void NavBallCollectorNode::update_visited_cells()
+{
+    if (!latest_odom_)
+    {
+        return;
+    }
+    
+    double x = latest_odom_->pose.pose.position.x;
+    double y = latest_odom_->pose.pose.position.y;
+    
+    int cell_x = static_cast<int>(std::floor(x / COVERAGE_CELL_SIZE));
+    int cell_y = static_cast<int>(std::floor(y / COVERAGE_CELL_SIZE));
+    
+    auto key = std::make_pair(cell_x, cell_y);
+    visited_cells_[key]++;
+}
+
+int NavBallCollectorNode::get_color_priority(const std::string & color)
+{
+    auto it = color_priority_.find(color);
+    if (it != color_priority_.end())
+    {
+        return it->second;
+    }
+    return 999;  // Unknown color = lowest priority
+}
+
+bool NavBallCollectorNode::is_higher_priority(const std::string & new_color, const std::string & current_color)
+{
+    return get_color_priority(new_color) < get_color_priority(current_color);
+}
+
+void NavBallCollectorNode::other_robot_odom_callback(
+    const nav_msgs::msg::Odometry::SharedPtr msg, 
+    const std::string & robot_name)
+{
+    other_robot_poses_[robot_name] = msg->pose.pose;
+}
+
+float NavBallCollectorNode::compute_robot_avoidance_steering()
+{
+    if (!latest_odom_ || other_robot_poses_.empty())
+    {
+        return 0.0f;
+    }
+    
+    double my_x = latest_odom_->pose.pose.position.x;
+    double my_y = latest_odom_->pose.pose.position.y;
+    
+    // Get my heading
+    double qz = latest_odom_->pose.pose.orientation.z;
+    double qw = latest_odom_->pose.pose.orientation.w;
+    double my_yaw = 2.0 * std::atan2(qz, qw);
+    
+    float avoidance_steering = 0.0f;
+    
+    for (const auto & [robot_name, pose] : other_robot_poses_)
+    {
+        double dx = pose.position.x - my_x;
+        double dy = pose.position.y - my_y;
+        double dist = std::sqrt(dx * dx + dy * dy);
+        
+        if (dist < robot_avoid_radius_ && dist > 0.1)
+        {
+            // Compute angle to other robot relative to my heading
+            double angle_to_robot = std::atan2(dy, dx) - my_yaw;
+            
+            // Normalize angle to [-pi, pi]
+            while (angle_to_robot > M_PI) angle_to_robot -= 2 * M_PI;
+            while (angle_to_robot < -M_PI) angle_to_robot += 2 * M_PI;
+            
+            // Stronger avoidance when closer
+            float strength = (robot_avoid_radius_ - dist) / robot_avoid_radius_;
+            
+            // Steer away from the robot (opposite direction)
+            if (angle_to_robot > 0)
+            {
+                avoidance_steering -= strength * max_steer_ * 0.5f;  // Turn right
+            }
+            else
+            {
+                avoidance_steering += strength * max_steer_ * 0.5f;  // Turn left
+            }
+            
+            RCLCPP_DEBUG(this->get_logger(), 
+                "Avoiding %s at dist=%.2fm, steering=%.2f",
+                robot_name.c_str(), dist, avoidance_steering);
+        }
+    }
+    
+    return std::clamp(avoidance_steering, static_cast<float>(-max_steer_), static_cast<float>(max_steer_));
+}
+
+void NavBallCollectorNode::execute_escape_maneuver()
+{
+    RCLCPP_WARN(this->get_logger(), "Executing escape maneuver - stuck detected!");
+    
+    // Cancel any navigation
+    cancel_navigation();
+    
+    // Find best escape direction using LiDAR
+    float best_angle, best_distance;
+    if (find_escape_direction(best_angle, best_distance))
+    {
+        // Backup diagonally opposite to escape direction
+        float backup_steer = (best_angle > 0) ? -max_steer_ * 0.7f : max_steer_ * 0.7f;
+        publish_cmd_vel(-recover_speed_, backup_steer);
+        
+        // Schedule transition to exploring after short backup
+        recover_start_time_ = this->now();
+        transition_to(NavCollectorState::RECOVERING);
+    }
+    else
+    {
+        // No escape found, just back up straight
+        publish_cmd_vel(-recover_speed_, 0.0);
+        recover_start_time_ = this->now();
+        transition_to(NavCollectorState::RECOVERING);
+    }
 }
 
 }  // namespace ballvac_ball_collector

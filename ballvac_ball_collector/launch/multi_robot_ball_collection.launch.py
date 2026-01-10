@@ -688,7 +688,7 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             'use_sim_time': True,
             # Robot identification
             'robot_id': robot_name,
-            'use_fleet_coordinator': True,
+            'use_fleet_coordinator': False,  # Disabled - robots act independently
             # Topics (namespaced)
             'scan_topic': f'/{robot_name}/scan',
             'detection_topic': f'/{robot_name}/ball_detections',
@@ -760,7 +760,8 @@ def generate_launch_description():
     # =========================================================================
     world_sdf = os.path.join(pkg_ballvac_description, 'worlds', 'ball_arena.sdf')
     rviz_config = os.path.join(pkg_ballvac_bringup, 'rviz', 'navigation.rviz')
-    initial_balls = parse_initial_balls(world_sdf)
+    # Balls are now spawned dynamically by ball_launcher_node, so no initial balls from SDF
+    initial_balls = []
     
     # =========================================================================
     # Launch arguments
@@ -872,31 +873,20 @@ def generate_launch_description():
     )
     
     # =========================================================================
-    # 4. Fleet Coordinator
+    # 4. Fleet Coordinator - DISABLED (robots act independently)
     # =========================================================================
-    fleet_coordinator = Node(
-        package='ballvac_ball_collector',
-        executable='fleet_coordinator_node',
-        name='fleet_coordinator',
-        output='screen',
-        parameters=[{
-            'use_sim_time': True,
-            'robot_names': ['ballvac1', 'ballvac2', 'ballvac3'],  # 3 robots
-            'color_priority': ['red', 'blue', 'green', 'yellow', 'orange', 'purple', 'cyan'],
-            'claim_timeout_sec': 20.0,        # Faster reassignment
-            'heartbeat_timeout_sec': 8.0,
-            'assignment_rate_hz': 4.0,        # Faster assignment checks
-            'standoff_distance': 0.5,
-            'use_planner_for_cost': False,
-            'map_bounds_min_x': -10.0,
-            'map_bounds_max_x': 10.0,
-            'map_bounds_min_y': -10.0,
-            'map_bounds_max_y': 10.0,
-            'wall_safety_margin': 1.5,        # Stay away from walls
-            'robot_conflict_radius': 2.0,     # Don't target same balls
-            'initial_balls': initial_balls,
-        }]
-    )
+    # fleet_coordinator = Node(
+    #     package='ballvac_ball_collector',
+    #     executable='fleet_coordinator_node',
+    #     name='fleet_coordinator',
+    #     output='screen',
+    #     parameters=[{
+    #         'use_sim_time': True,
+    #         'robot_names': ['ballvac1', 'ballvac2', 'ballvac3'],
+    #         'color_priority': ['red', 'blue', 'green', 'yellow', 'orange', 'purple', 'cyan'],
+    #         ...
+    #     }]
+    # )
     
     # =========================================================================
     # 5. RViz2 Visualization
@@ -974,11 +964,11 @@ def generate_launch_description():
             actions=[ball_launcher]
         ),
         
-        # Stage 5: Fleet coordinator (12s delay)
-        TimerAction(
-            period=12.0,
-            actions=[fleet_coordinator]
-        ),
+        # Stage 5: Fleet coordinator - DISABLED
+        # TimerAction(
+        #     period=12.0,
+        #     actions=[fleet_coordinator]
+        # ),
         
         # Stage 6: RViz (2s delay)
         TimerAction(

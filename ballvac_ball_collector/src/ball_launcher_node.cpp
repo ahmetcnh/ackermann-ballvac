@@ -155,16 +155,14 @@ BallLauncherNode::BallLauncherNode(const rclcpp::NodeOptions & options)
     RCLCPP_INFO(this->get_logger(), "  Respawn on delete: %s", respawn_on_delete_ ? "yes" : "no");
     RCLCPP_INFO(this->get_logger(), "========================================");
     
-    // Launch first ball after a short delay
-    if (auto_launch_)
-    {
-        auto initial_timer = this->create_wall_timer(
-            std::chrono::seconds(5),
-            [this]() {
-                this->launch_ball();
-                // This is a one-shot timer, cancel after first execution
-            });
-    }
+    // Spawn initial balls at random positions after a short delay
+    initial_spawn_timer_ = this->create_wall_timer(
+        std::chrono::seconds(3),
+        [this]() {
+            spawn_initial_balls();
+            // Cancel timer after first execution (one-shot)
+            initial_spawn_timer_->cancel();
+        });
 }
 
 // =============================================================================
@@ -211,27 +209,29 @@ void BallLauncherNode::launch_ball()
         return;
     }
     
-    // Generate random spawn position within arena (avoiding walls and center obstacles)
-    std::uniform_real_distribution<double> x_dist(-3.5, 3.5);
-    std::uniform_real_distribution<double> y_dist(-3.5, 3.5);
+    // Generate random spawn position within 20x20 arena (avoiding walls)
+    // Arena is 20x20, so valid range is approximately -9 to 9 to leave margin from walls
+    std::uniform_real_distribution<double> x_dist(-9.0, 9.0);
+    std::uniform_real_distribution<double> y_dist(-9.0, 9.0);
     
     double spawn_x, spawn_y;
     bool valid_position = false;
     int attempts = 0;
     
-    // Find a valid spawn position (avoid center and obstacles)
-    while (!valid_position && attempts < 20)
+    // Find a valid spawn position (avoid robot and center)
+    while (!valid_position && attempts < 50)
     {
         spawn_x = x_dist(rng_);
         spawn_y = y_dist(rng_);
         
-        // Avoid center area where robot might be
+        // Avoid center area where robot might be (3m radius)
         double dist_from_center = std::sqrt(spawn_x * spawn_x + spawn_y * spawn_y);
         
-        // Avoid robot spawn area (0, -3)
+        // Avoid robot spawn area (0, -3) with 2.5m radius
         double dist_from_robot_spawn = std::sqrt(spawn_x * spawn_x + (spawn_y + 3.0) * (spawn_y + 3.0));
         
-        if (dist_from_center > 1.5 && dist_from_robot_spawn > 1.0)
+        // Ball must be at least 3m from center AND 2.5m from robot spawn
+        if (dist_from_center > 3.0 && dist_from_robot_spawn > 2.5)
         {
             valid_position = true;
         }
@@ -287,6 +287,138 @@ void BallLauncherNode::launch_ball()
                " at (" + std::to_string(spawn_x).substr(0,4) + ", " + 
                std::to_string(spawn_y).substr(0,4) + ")";
     launch_info_pub_->publish(msg);
+}
+
+// =============================================================================
+// Spawn initial balls at random positions
+// =============================================================================
+
+void BallLauncherNode::spawn_initial_balls()
+{
+    if (!spawn_client_->service_is_ready())
+    {
+        RCLCPP_WARN(this->get_logger(), 
+            "Spawn service not ready, retrying in 2 seconds...");
+        // Retry after 2 seconds
+        auto retry_timer = this->create_wall_timer(
+            std::chrono::seconds(2),
+            [this]() {
+                spawn_initial_balls();
+            });
+        return;
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "========================================");
+    RCLCPP_INFO(this->get_logger(), "Spawning initial balls at random positions");
+    RCLCPP_INFO(this->get_logger(), "========================================");
+    
+    // Define initial ball set: 2 of each color
+    std::vector<std::string> initial_colors = {
+        "red", "red", 
+        "green", "green", 
+        "blue", "blue", 
+        "yellow", "yellow"
+    };
+    
+    // Random position distribution for 20x20 arena
+    std::uniform_real_distribution<double> x_dist(-9.0, 9.0);
+    std::uniform_real_distribution<double> y_dist(-9.0, 9.0);
+    
+    // Track spawned positions to avoid overlapping
+    std::vector<std::pair<double, double>> spawned_positions;
+    
+    // Per-color counter for entity naming (ball_red_1, ball_red_2, ball_green_1, etc.)
+    std::map<std::string, int> color_counters;
+    
+    for (const auto& color : initial_colors)
+    {
+        // Increment per-color counter
+        color_counters[color]++;
+        int color_num = color_counters[color];
+        
+        double spawn_x, spawn_y;
+        bool valid_position = false;
+        int attempts = 0;
+        
+        // Find a valid spawn position
+        while (!valid_position && attempts < 100)
+        {
+            spawn_x = x_dist(rng_);
+            spawn_y = y_dist(rng_);
+            
+            // Avoid center area (3m radius - robot spawn area)
+            double dist_from_center = std::sqrt(spawn_x * spawn_x + spawn_y * spawn_y);
+            if (dist_from_center < 3.0) {
+                attempts++;
+                continue;
+            }
+            
+            // Avoid robot spawn area (0, -3) with 2.5m radius
+            double dist_from_robot = std::sqrt(spawn_x * spawn_x + (spawn_y + 3.0) * (spawn_y + 3.0));
+            if (dist_from_robot < 2.5) {
+                attempts++;
+                continue;
+            }
+            
+            // Check distance from other balls (minimum 1.5m apart)
+            bool too_close = false;
+            for (const auto& pos : spawned_positions)
+            {
+                double dx = spawn_x - pos.first;
+                double dy = spawn_y - pos.second;
+                double dist = std::sqrt(dx * dx + dy * dy);
+                if (dist < 1.5)
+                {
+                    too_close = true;
+                    break;
+                }
+            }
+            
+            if (!too_close)
+            {
+                valid_position = true;
+            }
+            attempts++;
+        }
+        
+        // Record this position
+        spawned_positions.push_back({spawn_x, spawn_y});
+        
+        // Create spawn request
+        auto request = std::make_shared<ros_gz_interfaces::srv::SpawnEntity::Request>();
+        
+        std::string entity_name = "ball_" + color + "_" + std::to_string(color_num);
+        
+        request->entity_factory.name = entity_name;
+        request->entity_factory.allow_renaming = false;
+        request->entity_factory.sdf = generate_ball_sdf(color, 0.0, 0.0, 0.0);
+        request->entity_factory.pose.position.x = spawn_x;
+        request->entity_factory.pose.position.y = spawn_y;
+        request->entity_factory.pose.position.z = 0.15;
+        
+        RCLCPP_INFO(this->get_logger(), 
+            "Spawning %s ball '%s' at (%.2f, %.2f)",
+            color.c_str(), entity_name.c_str(), spawn_x, spawn_y);
+        
+        // Send spawn request
+        spawn_client_->async_send_request(
+            request,
+            std::bind(&BallLauncherNode::spawn_callback, this, std::placeholders::_1));
+        
+        // Track spawned ball
+        SpawnedBall ball_info;
+        ball_info.name = entity_name;
+        ball_info.color = color;
+        ball_info.x = spawn_x;
+        ball_info.y = spawn_y;
+        spawned_balls_.push_back(ball_info);
+        
+        balls_launched_++;
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "========================================");
+    RCLCPP_INFO(this->get_logger(), "Spawned %zu balls at random positions", spawned_positions.size());
+    RCLCPP_INFO(this->get_logger(), "========================================");
 }
 
 // =============================================================================
