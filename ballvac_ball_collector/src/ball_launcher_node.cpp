@@ -69,7 +69,7 @@ BallLauncherNode::BallLauncherNode(const rclcpp::NodeOptions & options)
     // -------------------------------------------------------------------------
     // Initialize colors
     // -------------------------------------------------------------------------
-    colors_ = {"red", "green", "blue", "yellow", "cyan", "purple"};
+    colors_ = {"red", "green", "blue", "yellow", "cyan", "purple", "orange", "pink", "lime", "teal"};
     
     // -------------------------------------------------------------------------
     // Initialize random number generator
@@ -312,12 +312,9 @@ void BallLauncherNode::spawn_initial_balls()
     RCLCPP_INFO(this->get_logger(), "Spawning initial balls at random positions");
     RCLCPP_INFO(this->get_logger(), "========================================");
     
-    // Define initial ball set: 2 of each color
+    // Define initial ball set: one of each color (10 total)
     std::vector<std::string> initial_colors = {
-        "red", "red", 
-        "green", "green", 
-        "blue", "blue", 
-        "yellow", "yellow"
+        "red", "green", "blue", "yellow", "cyan", "purple", "orange", "pink", "lime", "teal"
     };
     
     // Random position distribution for 20x20 arena
@@ -327,15 +324,8 @@ void BallLauncherNode::spawn_initial_balls()
     // Track spawned positions to avoid overlapping
     std::vector<std::pair<double, double>> spawned_positions;
     
-    // Per-color counter for entity naming (ball_red_1, ball_red_2, ball_green_1, etc.)
-    std::map<std::string, int> color_counters;
-    
     for (const auto& color : initial_colors)
     {
-        // Increment per-color counter
-        color_counters[color]++;
-        int color_num = color_counters[color];
-        
         double spawn_x, spawn_y;
         bool valid_position = false;
         int attempts = 0;
@@ -387,7 +377,7 @@ void BallLauncherNode::spawn_initial_balls()
         // Create spawn request
         auto request = std::make_shared<ros_gz_interfaces::srv::SpawnEntity::Request>();
         
-        std::string entity_name = "ball_" + color + "_" + std::to_string(color_num);
+        std::string entity_name = "ball_" + color;
         
         request->entity_factory.name = entity_name;
         request->entity_factory.allow_renaming = false;
@@ -531,6 +521,14 @@ void BallLauncherNode::get_color_rgb(const std::string & color,
         ambient = "0.0 1.0 1.0 1"; diffuse = "0.0 1.0 1.0 1"; emissive = "0.0 0.1 0.1 1";
     } else if (color == "purple") {
         ambient = "0.6 0.0 0.8 1"; diffuse = "0.6 0.0 0.8 1"; emissive = "0.06 0.0 0.08 1";
+    } else if (color == "orange") {
+        ambient = "1.0 0.5 0.0 1"; diffuse = "1.0 0.5 0.0 1"; emissive = "0.1 0.05 0.0 1";
+    } else if (color == "pink") {
+        ambient = "1.0 0.0 0.5 1"; diffuse = "1.0 0.0 0.5 1"; emissive = "0.1 0.0 0.05 1";
+    } else if (color == "lime") {
+        ambient = "0.5 1.0 0.0 1"; diffuse = "0.5 1.0 0.0 1"; emissive = "0.05 0.1 0.0 1";
+    } else if (color == "teal") {
+        ambient = "0.0 0.5 0.5 1"; diffuse = "0.0 0.5 0.5 1"; emissive = "0.0 0.05 0.05 1";
     } else {
         ambient = "1.0 1.0 1.0 1"; diffuse = "1.0 1.0 1.0 1"; emissive = "0.1 0.1 0.1 1";
     }

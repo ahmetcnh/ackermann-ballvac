@@ -75,7 +75,9 @@ BallPerceptionNode::BallPerceptionNode(const rclcpp::NodeOptions & options)
     if (publish_debug_image_)
     {
         debug_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            "/ball_perception/debug_image", 10);
+            "ball_perception/debug_image", 10);
+        debug_mask_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+            "ball_perception/debug_mask", 10);
     }
 
     // -------------------------------------------------------------------------
@@ -89,7 +91,7 @@ BallPerceptionNode::BallPerceptionNode(const rclcpp::NodeOptions & options)
     RCLCPP_INFO(this->get_logger(), "  Debug image: %s", publish_debug_image_ ? "enabled" : "disabled");
     RCLCPP_INFO(this->get_logger(), "  Min contour area: %d px^2", min_contour_area_);
     RCLCPP_INFO(this->get_logger(), "  Camera HFOV: %.3f rad", camera_hfov_);
-    RCLCPP_INFO(this->get_logger(), "  Detecting colors: red, green, blue, cyan, orange, yellow, purple");
+    RCLCPP_INFO(this->get_logger(), "  Detecting colors: red, green, blue, cyan, orange, yellow, purple, pink, lime, teal");
     RCLCPP_INFO(this->get_logger(), "========================================");
 }
 
@@ -133,7 +135,7 @@ void BallPerceptionNode::initialize_color_ranges()
     // CYAN/TURQUOISE - bright blue-green color
     ColorRange cyan;
     cyan.name = "cyan";
-    cyan.lower1 = cv::Scalar(80, 100, 100);  // Hue 80-100 for cyan
+    cyan.lower1 = cv::Scalar(90, 100, 100);  // Hue 90-100 for bright cyan
     cyan.upper1 = cv::Scalar(100, 255, 255);
     cyan.has_secondary = false;
     color_ranges_.push_back(cyan);
@@ -154,13 +156,41 @@ void BallPerceptionNode::initialize_color_ranges()
     yellow.has_secondary = false;
     color_ranges_.push_back(yellow);
 
-    // PURPLE/MAGENTA
+    // PURPLE/MAGENTA - RGB (0.6, 0.0, 0.8) from ball_launcher
+    // In HSV: H=280°/2=140 (OpenCV), high saturation, medium-high value
     ColorRange purple;
     purple.name = "purple";
-    purple.lower1 = cv::Scalar(130, 100, 100);
+    purple.lower1 = cv::Scalar(125, 80, 80);   // Widened: H:125-160
     purple.upper1 = cv::Scalar(160, 255, 255);
     purple.has_secondary = false;
     color_ranges_.push_back(purple);
+
+    // PINK - light red/magenta with high value
+    // Widened range to catch more pink variations
+    ColorRange pink;
+    pink.name = "pink";
+    pink.lower1 = cv::Scalar(135, 40, 120);  // Widened: H:135-175, S:40+, V:120+
+    pink.upper1 = cv::Scalar(175, 255, 255);
+    pink.has_secondary = false;
+    color_ranges_.push_back(pink);
+
+    // LIME - yellow-green
+    ColorRange lime;
+    lime.name = "lime";
+    lime.lower1 = cv::Scalar(30, 100, 100);
+    lime.upper1 = cv::Scalar(50, 255, 255);
+    lime.has_secondary = false;
+    color_ranges_.push_back(lime);
+
+    // TEAL - RGB (0.0, 0.5, 0.5) from ball_launcher  
+    // In HSV: H=180°/2=90 (OpenCV), medium saturation, medium value
+    // This is a darker cyan/blue-green
+    ColorRange teal;
+    teal.name = "teal";
+    teal.lower1 = cv::Scalar(80, 50, 50);   // Widened: H:80-100, lower S and V thresholds
+    teal.upper1 = cv::Scalar(100, 255, 255);
+    teal.has_secondary = false;
+    color_ranges_.push_back(teal);
 }
 
 // =============================================================================
@@ -204,9 +234,12 @@ void BallPerceptionNode::image_callback(const sensor_msgs::msg::Image::SharedPtr
     // -------------------------------------------------------------------------
     std::vector<BallDetectionResult> all_detections;
     
+    // Accumulate binary mask for debug purposes (all colors combined)
+    cv::Mat accumulated_mask = cv::Mat::zeros(hsv_image.size(), CV_8UC1);
+
     for (const auto & color_range : color_ranges_)
     {
-        auto detections = detect_color(hsv_image, color_range);
+        auto detections = detect_color(hsv_image, color_range, accumulated_mask);
         all_detections.insert(all_detections.end(), detections.begin(), detections.end());
     }
 
@@ -252,6 +285,9 @@ void BallPerceptionNode::image_callback(const sensor_msgs::msg::Image::SharedPtr
             else if (det.color == "yellow") draw_color = cv::Scalar(0, 255, 255);
             else if (det.color == "orange") draw_color = cv::Scalar(0, 165, 255);
             else if (det.color == "purple") draw_color = cv::Scalar(255, 0, 255);
+            else if (det.color == "pink") draw_color = cv::Scalar(203, 192, 255);
+            else if (det.color == "lime") draw_color = cv::Scalar(0, 255, 128);
+            else if (det.color == "teal") draw_color = cv::Scalar(128, 128, 0);
             else draw_color = cv::Scalar(255, 255, 255);
 
             // Draw circle around detection
@@ -279,6 +315,12 @@ void BallPerceptionNode::image_callback(const sensor_msgs::msg::Image::SharedPtr
         // Convert back to ROS message and publish
         auto debug_msg = cv_bridge::CvImage(msg->header, "bgr8", debug_frame).toImageMsg();
         debug_image_pub_->publish(*debug_msg);
+
+        // Publish debug mask
+        if (debug_mask_pub_) {
+             auto mask_msg = cv_bridge::CvImage(msg->header, "mono8", accumulated_mask).toImageMsg();
+             debug_mask_pub_->publish(*mask_msg);
+        }
     }
 
     // Log detection summary periodically
@@ -294,7 +336,8 @@ void BallPerceptionNode::image_callback(const sensor_msgs::msg::Image::SharedPtr
 
 std::vector<BallDetectionResult> BallPerceptionNode::detect_color(
     const cv::Mat & hsv_image,
-    const ColorRange & color_range)
+    const ColorRange & color_range,
+    cv::Mat & accumulated_mask)
 {
     std::vector<BallDetectionResult> results;
 
@@ -319,6 +362,9 @@ std::vector<BallDetectionResult> BallPerceptionNode::detect_color(
     cv::erode(mask, mask, erode_kernel_, cv::Point(-1, -1), 2);
     // Dilate to restore blob size and fill small holes
     cv::dilate(mask, mask, dilate_kernel_, cv::Point(-1, -1), 2);
+
+    // Add this mask to the accumulated global mask
+    cv::bitwise_or(accumulated_mask, mask, accumulated_mask);
 
     // -------------------------------------------------------------------------
     // Find contours

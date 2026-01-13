@@ -315,7 +315,9 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
     nodes.append(static_tf_camera)
     
     # =========================================================================
-    # 5. SLAM / Localization
+    # 5. SLAM - ONLY first robot runs SLAM
+    # Other robots use odometry-only (nav_ball_collector uses reactive LiDAR control)
+    # This prevents map flickering and keeps robots stable
     # =========================================================================
     if robot_index == 0:
         # First robot runs SLAM and publishes map
@@ -342,53 +344,27 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             ]
         )
         nodes.append(slam_node)
-
-        # NOTE: slam_toolbox is NOT a lifecycle node, so no lifecycle manager needed
-        # It will start publishing map and TF automatically
     else:
-        # Other robots use AMCL for localization on the shared map
-        amcl_node = Node(
-            package='nav2_amcl',
-            executable='amcl',
-            name='amcl',
-            namespace=robot_name,
-            output='screen',
-            parameters=[
-                robot_nav2_params,
-                {
-                    'use_sim_time': True,
-                    'base_frame_id': base_frame,
-                    'odom_frame_id': odom_frame,
-                    'global_frame_id': 'map',
-                    'scan_topic': f'/{robot_name}/scan',
-                    'set_initial_pose': True,
-                    'initial_pose.x': spawn_x,
-                    'initial_pose.y': spawn_y,
-                    'initial_pose.yaw': spawn_yaw,
-                }
-            ],
-            remappings=[
-                ('map', '/map'),
-                *tf_remaps,
-            ]
-        )
-        nodes.append(amcl_node)
+        # Other robots need static TF from map -> odom at their spawn position
+        # This connects their TF tree to the map frame
+        # Convert spawn_yaw to quaternion
+        import math
+        qz = math.sin(spawn_yaw / 2.0)
+        qw = math.cos(spawn_yaw / 2.0)
         
-        # AMCL lifecycle manager
-        amcl_lifecycle = Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_amcl',
-            namespace=robot_name,
-            output='screen',
-            parameters=[{
-                'use_sim_time': True,
-                'autostart': True,
-                'node_names': ['amcl'],
-                'bond_timeout': 0.0,
-            }]
+        static_map_to_odom = Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name=f'{robot_name}_map_to_odom',
+            # publish: map -> odom at spawn position
+            arguments=[
+                str(spawn_x), str(spawn_y), '0',  # x, y, z
+                '0', '0', str(qz), str(qw),       # qx, qy, qz, qw
+                'map', odom_frame
+            ],
+            parameters=[{'use_sim_time': True}],
         )
-        nodes.append(amcl_lifecycle)
+        nodes.append(static_map_to_odom)
     
     # =========================================================================
     # 6. Nav2 Stack
@@ -450,8 +426,8 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
                     'local_costmap.local_costmap.obstacle_layer.scan.max_obstacle_height': 2.5,
                     'local_costmap.local_costmap.inflation_layer.plugin': 'nav2_costmap_2d::InflationLayer',
                     'local_costmap.local_costmap.inflation_layer.enabled': True,
-                    'local_costmap.local_costmap.inflation_layer.inflation_radius': 0.40,
-                    'local_costmap.local_costmap.inflation_layer.cost_scaling_factor': 3.0,
+                    'local_costmap.local_costmap.inflation_layer.inflation_radius': 0.60,  # Increased to keep further from walls
+                    'local_costmap.local_costmap.inflation_layer.cost_scaling_factor': 5.0,  # Stronger wall penalty
                     # Controller params - RPP with collision detection disabled - FAST
                     'FollowPath.plugin': 'nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController',
                     'FollowPath.desired_linear_vel': 1.8,       # FAST!
@@ -530,8 +506,8 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
                     'global_costmap.global_costmap.obstacle_layer.scan.max_obstacle_height': 2.5,
                     'global_costmap.global_costmap.inflation_layer.plugin': 'nav2_costmap_2d::InflationLayer',
                     'global_costmap.global_costmap.inflation_layer.enabled': True,
-                    'global_costmap.global_costmap.inflation_layer.inflation_radius': 0.40,
-                    'global_costmap.global_costmap.inflation_layer.cost_scaling_factor': 3.0,
+                    'global_costmap.global_costmap.inflation_layer.inflation_radius': 0.60,  # Increased to keep further from walls
+                    'global_costmap.global_costmap.inflation_layer.cost_scaling_factor': 5.0,  # Stronger wall penalty
                 }
             ],
             remappings=tf_remaps,
@@ -716,7 +692,7 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
             'control_rate': 30.0,              # Fast control loop
             'steering_gain': 4.0,              # Responsive steering
             # Ball detection parameters
-            'approach_radius_threshold': 80.0,   # Ball pixel size to trigger collection (larger = closer)
+            'approach_radius_threshold': 50.0,   # Ball pixel size to trigger collection (larger = closer)
             'min_ball_radius': 8.0,              # Detect smaller balls further away
             'max_ball_radius': 250.0,
             'collection_cooldown': 0.3,        # Faster cooldown
@@ -801,11 +777,13 @@ def generate_launch_description():
     # =========================================================================
     # Robot spawn positions (spread apart to avoid collisions)
     # Triangle formation - 120 degrees apart, 4m from center
+    # Yaw values rotated 180 degrees (π) from original
     # =========================================================================
+    import math
     robots = [
-        {'name': 'ballvac1', 'x': 0.0, 'y': -4.0, 'yaw': 1.57},     # South position
-        {'name': 'ballvac2', 'x': -3.5, 'y': 2.0, 'yaw': -0.52},    # Northwest position
-        {'name': 'ballvac3', 'x': 3.5, 'y': 2.0, 'yaw': -2.62},     # Northeast position
+        {'name': 'ballvac1', 'x': 0.0, 'y': -4.0, 'yaw': 1.57 + math.pi},     # South position, facing north
+        {'name': 'ballvac2', 'x': -3.5, 'y': 2.0, 'yaw': -0.52 + math.pi},    # Northwest position, facing southeast
+        {'name': 'ballvac3', 'x': 3.5, 'y': 2.0, 'yaw': -2.62 + math.pi},     # Northeast position, facing southwest
     ]
     
     # =========================================================================

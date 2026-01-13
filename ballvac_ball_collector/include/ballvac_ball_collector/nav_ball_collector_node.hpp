@@ -23,6 +23,8 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <nav2_msgs/action/navigate_to_pose.hpp>
 #include <nav2_msgs/action/compute_path_to_pose.hpp>
 #include <ballvac_msgs/msg/ball_detection.hpp>
@@ -140,6 +142,7 @@ private:
     void publish_claim(const std::string & ball_id);
     void publish_collected(const std::string & ball_id);
     void publish_lost(const std::string & ball_id);
+    void publish_release(const std::string & ball_id);
     bool is_ball_claimed_by_other(const std::string & ball_id);
 
     // =========================================================================
@@ -322,7 +325,10 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ball_deleted_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ball_claimed_pub_;  // Publish when claiming a ball
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr ball_claimed_sub_;  // Track other robots' claims
+    rclcpp::Subscription<ballvac_msgs::msg::BallDetectionArray>::SharedPtr fleet_ball_pos_sub_; // Ground truth positions
     rclcpp::Publisher<ballvac_msgs::msg::BallDetectionArray>::SharedPtr fleet_ball_pos_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;  // Robot trajectory visualization
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr path_marker_pub_;  // Colored path marker
     
     // Action client for Nav2
     rclcpp_action::Client<NavigateToPose>::SharedPtr nav_to_pose_client_;
@@ -408,6 +414,13 @@ private:
     double nav_goal_retry_cooldown_;
     double wander_bias_interval_;
     double wander_bias_max_;
+    
+    // Zone-based exploration (each robot gets its own zone to clean)
+    int robot_index_;           // 0, 1, 2 - determines which zone
+    double zone_min_x_;         // This robot's assigned zone bounds
+    double zone_max_x_;
+    double zone_min_y_;
+    double zone_max_y_;
 
     // =========================================================================
     // State variables
@@ -444,7 +457,11 @@ private:
     // Ball collection tracking
     std::set<std::string> collected_balls_;
     std::map<std::string, int> ball_collect_count_;
+    std::map<std::string, geometry_msgs::msg::Point> ground_truth_balls_; // Ground truth from launcher
     rclcpp::Time last_collection_time_;
+    
+    // Callback
+    void fleet_ball_pos_callback(const ballvac_msgs::msg::BallDetectionArray::SharedPtr msg);
     
     // Fleet coordination state
     ballvac_msgs::msg::RobotAssignment current_assignment_;
@@ -494,6 +511,7 @@ private:
     // =========================================================================
     static constexpr double COVERAGE_CELL_SIZE = 1.0;  // 1m cells
     std::map<std::pair<int,int>, int> visited_cells_;  // (x_cell, y_cell) -> visit_count
+    nav_msgs::msg::Path path_history_;  // Robot trajectory for RViz visualization
     
     // =========================================================================
     // NEW: Color priority for target selection (lower = higher priority)
@@ -514,6 +532,12 @@ private:
     rclcpp::Time last_movement_time_;
     double stall_timeout_;
     double velocity_threshold_;
+    
+    // =========================================================================
+    // NEW: Ball collection completion tracking
+    // =========================================================================
+    rclcpp::Time collection_start_time_;
+    bool completion_logged_;
 };
 
 }  // namespace ballvac_ball_collector

@@ -86,7 +86,8 @@ private:
      */
     std::vector<BallDetectionResult> detect_color(
         const cv::Mat & hsv_image,
-        const ColorRange & color_range);
+        const ColorRange & color_range,
+        cv::Mat & accumulated_mask);
 
     /**
      * @brief Calculate bearing angle from image center
@@ -100,6 +101,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::Publisher<ballvac_msgs::msg::BallDetectionArray>::SharedPtr detection_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_mask_pub_;
 
     // Parameters
     std::string image_topic_;

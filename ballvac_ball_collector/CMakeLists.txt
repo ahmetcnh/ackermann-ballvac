@@ -29,6 +29,7 @@ find_package(ros_gz_interfaces REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 # Include directories
 include_directories(
@@ -139,6 +140,7 @@ ament_target_dependencies(nav_ball_collector_node
   tf2
   tf2_ros
   tf2_geometry_msgs
+  visualization_msgs
 )
 
 # ==============================================================================
