@@ -345,27 +345,63 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
         )
         nodes.append(slam_node)
     else:
-        # Other robots need static TF from map -> odom at their spawn position
-        # This connects their TF tree to the map frame
-        # Convert spawn_yaw to quaternion
-        import math
-        qz = math.sin(spawn_yaw / 2.0)
-        qw = math.cos(spawn_yaw / 2.0)
-        
-        static_map_to_odom = Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name=f'{robot_name}_map_to_odom',
-            # publish: map -> odom at spawn position
-            arguments=[
-                str(spawn_x), str(spawn_y), '0',  # x, y, z
-                '0', '0', str(qz), str(qw),       # qx, qy, qz, qw
-                'map', odom_frame
+        # Other robots use AMCL for localization on the shared map
+        amcl_node = Node(
+            package='nav2_amcl',
+            executable='amcl',
+            name='amcl',
+            namespace=robot_name,
+            output='screen',
+            parameters=[
+                robot_nav2_params,
+                {
+                    'use_sim_time': True,
+                    'base_frame_id': base_frame,
+                    'odom_frame_id': odom_frame,
+                    'global_frame_id': 'map',
+                    'scan_topic': f'/{robot_name}/scan',
+                    'map_topic': '/map',
+                    'robot_model_type': 'nav2_amcl::DifferentialMotionModel',
+                    'tf_broadcast': True,
+                    'transform_tolerance': 1.0,
+                    'alpha1': 0.2,
+                    'alpha2': 0.2,
+                    'alpha3': 0.2,
+                    'alpha4': 0.2,
+                    'alpha5': 0.2,
+                    'laser_likelihood_max_dist': 2.0,
+                    'laser_max_range': 12.0,
+                    'laser_min_range': 0.2,
+                    'laser_model_type': 'likelihood_field',
+                    'max_beams': 60,
+                    'max_particles': 2000,
+                    'min_particles': 500,
+                    'pf_err': 0.05,
+                    'pf_z': 0.99,
+                    'recovery_alpha_fast': 0.1,
+                    'recovery_alpha_slow': 0.001,
+                    'resample_interval': 1,
+                    'update_min_a': 0.2,
+                    'update_min_d': 0.15,
+                    'z_hit': 0.5,
+                    'z_max': 0.05,
+                    'z_rand': 0.5,
+                    'z_short': 0.05,
+                    'set_initial_pose': True,
+                    'always_reset_initial_pose': True,
+                    'first_map_only': False,
+                    'initial_pose.x': spawn_x,
+                    'initial_pose.y': spawn_y,
+                    'initial_pose.z': 0.0,
+                    'initial_pose.yaw': spawn_yaw,
+                }
             ],
-            parameters=[{'use_sim_time': True}],
+            remappings=[
+                ('map', '/map'),
+                *tf_remaps,
+            ]
         )
-        nodes.append(static_map_to_odom)
-    
+        nodes.append(amcl_node)
     # =========================================================================
     # 6. Nav2 Stack
     # =========================================================================
@@ -592,28 +628,36 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
                 ('cmd_vel_smoothed', f'/{robot_name}/cmd_vel'),
             ]
         ),
-        
-        # Lifecycle manager
-        Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_navigation',
-            namespace=robot_name,
-            output='screen',
-            parameters=[{
-                'use_sim_time': True,
-                'autostart': True,
-                'node_names': [
-                    'controller_server',
-                    'planner_server',
-                    'behavior_server',
-                    'bt_navigator',
-                    'velocity_smoother',
-                ],
-                'bond_timeout': 0.0,
-            }],
-        ),
     ]
+    
+    # Lifecycle manager - add AMCL for non-SLAM robots
+    lifecycle_nodes = [
+        'controller_server',
+        'planner_server',
+        'behavior_server',
+        'bt_navigator',
+        'velocity_smoother',
+    ]
+    if robot_index != 0:
+        # AMCL robots need AMCL in lifecycle
+        lifecycle_nodes.insert(0, 'amcl')
+    
+    lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        namespace=robot_name,
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'autostart': True,
+            'node_names': lifecycle_nodes,
+            'bond_timeout': 0.0,
+        }],
+    )
+    nav2_nodes.append(lifecycle_manager)
+    
+    
     nodes.extend(nav2_nodes)
     
     # =========================================================================
