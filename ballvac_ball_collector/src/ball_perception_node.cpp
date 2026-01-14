@@ -135,8 +135,8 @@ void BallPerceptionNode::initialize_color_ranges()
     // CYAN/TURQUOISE - bright blue-green color
     ColorRange cyan;
     cyan.name = "cyan";
-    cyan.lower1 = cv::Scalar(90, 100, 100);  // Hue 90-100 for bright cyan
-    cyan.upper1 = cv::Scalar(100, 255, 255);
+    cyan.lower1 = cv::Scalar(85, 100, 100);  // Hue 85-95 for bright cyan (shifted to avoid teal overlap)
+    cyan.upper1 = cv::Scalar(95, 255, 255);
     cyan.has_secondary = false;
     color_ranges_.push_back(cyan);
 
@@ -183,12 +183,12 @@ void BallPerceptionNode::initialize_color_ranges()
     color_ranges_.push_back(lime);
 
     // TEAL - RGB (0.0, 0.5, 0.5) from ball_launcher  
-    // In HSV: H=180°/2=90 (OpenCV), medium saturation, medium value
-    // This is a darker cyan/blue-green
+    // In HSV: H=180°/2=90 (OpenCV), medium saturation (~50%), medium value (~50%)
+    // Teal is darker and less saturated than cyan - use Value threshold to differentiate
     ColorRange teal;
     teal.name = "teal";
-    teal.lower1 = cv::Scalar(80, 50, 50);   // Widened: H:80-100, lower S and V thresholds
-    teal.upper1 = cv::Scalar(100, 255, 255);
+    teal.lower1 = cv::Scalar(85, 50, 50);   // H:85-95 overlaps with cyan, but lower V range
+    teal.upper1 = cv::Scalar(95, 200, 180); // Cap saturation and value at 200/180 (teal is darker)
     teal.has_secondary = false;
     color_ranges_.push_back(teal);
 }
@@ -288,6 +288,7 @@ void BallPerceptionNode::image_callback(const sensor_msgs::msg::Image::SharedPtr
             else if (det.color == "pink") draw_color = cv::Scalar(203, 192, 255);
             else if (det.color == "lime") draw_color = cv::Scalar(0, 255, 128);
             else if (det.color == "teal") draw_color = cv::Scalar(128, 128, 0);
+            else if (det.color == "cyan") draw_color = cv::Scalar(255, 255, 0);
             else draw_color = cv::Scalar(255, 255, 255);
 
             // Draw circle around detection

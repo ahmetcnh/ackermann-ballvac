@@ -218,20 +218,13 @@ void BallLauncherNode::launch_ball()
     bool valid_position = false;
     int attempts = 0;
     
-    // Find a valid spawn position (avoid robot and center)
+    // Find a valid spawn position (avoid robots, obstacles, and center)
     while (!valid_position && attempts < 50)
     {
         spawn_x = x_dist(rng_);
         spawn_y = y_dist(rng_);
         
-        // Avoid center area where robot might be (3m radius)
-        double dist_from_center = std::sqrt(spawn_x * spawn_x + spawn_y * spawn_y);
-        
-        // Avoid robot spawn area (0, -3) with 2.5m radius
-        double dist_from_robot_spawn = std::sqrt(spawn_x * spawn_x + (spawn_y + 3.0) * (spawn_y + 3.0));
-        
-        // Ball must be at least 3m from center AND 2.5m from robot spawn
-        if (dist_from_center > 3.0 && dist_from_robot_spawn > 2.5)
+        if (is_valid_spawn_position(spawn_x, spawn_y))
         {
             valid_position = true;
         }
@@ -336,16 +329,8 @@ void BallLauncherNode::spawn_initial_balls()
             spawn_x = x_dist(rng_);
             spawn_y = y_dist(rng_);
             
-            // Avoid center area (3m radius - robot spawn area)
-            double dist_from_center = std::sqrt(spawn_x * spawn_x + spawn_y * spawn_y);
-            if (dist_from_center < 3.0) {
-                attempts++;
-                continue;
-            }
-            
-            // Avoid robot spawn area (0, -3) with 2.5m radius
-            double dist_from_robot = std::sqrt(spawn_x * spawn_x + (spawn_y + 3.0) * (spawn_y + 3.0));
-            if (dist_from_robot < 2.5) {
+            // Check against robots and obstacles
+            if (!is_valid_spawn_position(spawn_x, spawn_y)) {
                 attempts++;
                 continue;
             }
@@ -409,6 +394,13 @@ void BallLauncherNode::spawn_initial_balls()
     RCLCPP_INFO(this->get_logger(), "========================================");
     RCLCPP_INFO(this->get_logger(), "Spawned %zu balls at random positions", spawned_positions.size());
     RCLCPP_INFO(this->get_logger(), "========================================");
+    
+    // Track for completion detection
+    initial_ball_count_ = static_cast<int>(spawned_positions.size());
+    collected_ball_count_ = 0;
+    spawn_start_time_ = this->now();
+    completion_announced_ = false;
+    collected_balls_.clear();
 }
 
 // =============================================================================
@@ -535,20 +527,101 @@ void BallLauncherNode::get_color_rgb(const std::string & color,
 }
 
 // =============================================================================
+// Check if position is valid for ball spawn (away from robots and obstacles)
+// =============================================================================
+
+bool BallLauncherNode::is_valid_spawn_position(double x, double y)
+{
+    // Obstacle positions from ball_arena.sdf with their effect radius
+    // Format: {x, y, radius}
+    static const std::vector<std::tuple<double, double, double>> obstacles = {
+        {5.0, 5.0, 1.5},       // box_1
+        {-5.0, -5.0, 1.5},     // box_2
+        {7.0, -3.0, 1.0},      // box_3
+        {-2.0, 7.0, 1.5},      // barrier_L1
+        {-3.7, 6.0, 1.0},      // barrier_L2
+        {3.0, -7.0, 1.0},      // cylinder_1
+        {-7.0, 0.0, 1.0},      // stack_1, stack_2
+        {2.0, -3.5, 2.0},      // barrier_south
+        {0.0, 0.5, 1.0},       // pillar (center)
+    };
+    
+    // Check minimum distance from center
+    double dist_center = std::sqrt(x * x + y * y);
+    if (dist_center < 2.0)
+    {
+        return false;  // Too close to center
+    }
+    
+    // Check distance from all robot spawn positions
+    for (const auto& robot_pos : ROBOT_SPAWN_POSITIONS)
+    {
+        double dx = x - robot_pos.first;
+        double dy = y - robot_pos.second;
+        double dist = std::sqrt(dx * dx + dy * dy);
+        if (dist < MIN_ROBOT_DISTANCE)
+        {
+            return false;  // Too close to robot spawn
+        }
+    }
+    
+    // Check distance from all obstacles
+    for (const auto& obs : obstacles)
+    {
+        double dx = x - std::get<0>(obs);
+        double dy = y - std::get<1>(obs);
+        double radius = std::get<2>(obs);
+        double dist = std::sqrt(dx * dx + dy * dy);
+        if (dist < MIN_OBSTACLE_DISTANCE + radius)
+        {
+            return false;  // Too close to obstacle
+        }
+    }
+    
+    return true;
+}
+
+// =============================================================================
 // Ball deleted callback - respawn a new ball when one is collected
 // =============================================================================
 
 void BallLauncherNode::ball_deleted_callback(const std_msgs::msg::String::SharedPtr msg)
 {
-    if (!respawn_on_delete_)
+    // Parse message format: "ball_name" or "ball_name:robot_id"
+    std::string data = msg->data;
+    if (data.empty())
     {
         return;
     }
-
-    std::string deleted_ball = msg->data;
     
-    RCLCPP_INFO(this->get_logger(), "Ball deleted notification: %s - spawning replacement", 
-        deleted_ball.c_str());
+    std::string deleted_ball;
+    std::string deleter_robot;
+    size_t sep = data.find(':');
+    if (sep != std::string::npos)
+    {
+        deleted_ball = data.substr(0, sep);
+        deleter_robot = data.substr(sep + 1);
+    }
+    else
+    {
+        deleted_ball = data;
+        deleter_robot = "unknown";
+    }
+    
+    // Skip if already collected (duplicate message)
+    if (collected_balls_.count(deleted_ball) > 0)
+    {
+        return;
+    }
+    
+    // Track this collection
+    collected_balls_.insert(deleted_ball);
+    collected_ball_count_++;
+    
+    RCLCPP_INFO(this->get_logger(), 
+        "✅ Ball '%s' collected by %s [%d/%d]",
+        deleted_ball.c_str(), deleter_robot.c_str(), 
+        collected_ball_count_, initial_ball_count_);
     
     // Remove from tracking
     spawned_balls_.erase(
@@ -556,14 +629,51 @@ void BallLauncherNode::ball_deleted_callback(const std_msgs::msg::String::Shared
             [&deleted_ball](const SpawnedBall& b) { return b.name == deleted_ball; }),
         spawned_balls_.end());
     
-    // Wait a moment, then spawn a new ball
-    auto respawn_timer = this->create_wall_timer(
-        std::chrono::milliseconds(500),
-        [this]() {
-            this->launch_ball();
-        });
-    // Cancel after one shot - create_wall_timer doesn't have one_shot option,
-    // so we'll just let it fire once and it will be cleaned up
+    // Check if all balls collected
+    if (collected_ball_count_ >= initial_ball_count_ && !completion_announced_)
+    {
+        completion_announced_ = true;
+        
+        // Calculate total time
+        double elapsed_seconds = (this->now() - spawn_start_time_).seconds();
+        int minutes = static_cast<int>(elapsed_seconds) / 60;
+        int seconds = static_cast<int>(elapsed_seconds) % 60;
+        
+        RCLCPP_INFO(this->get_logger(), 
+            "========================================");
+        RCLCPP_INFO(this->get_logger(), 
+            "🎉🎉🎉 ALL BALLS COLLECTED! 🎉🎉🎉");
+        RCLCPP_INFO(this->get_logger(), 
+            "Total time: %d:%02d", minutes, seconds);
+        RCLCPP_INFO(this->get_logger(), 
+            "========================================");
+        
+        // Publish completion message for GUI
+        auto completion_msg = std_msgs::msg::String();
+        completion_msg.data = "COMPLETE:" + std::to_string(minutes) + ":" + 
+                              (seconds < 10 ? "0" : "") + std::to_string(seconds);
+        launch_info_pub_->publish(completion_msg);
+        
+        // Shutdown Gazebo after 3 seconds
+        auto shutdown_timer = this->create_wall_timer(
+            std::chrono::seconds(3),
+            [this]() {
+                RCLCPP_INFO(this->get_logger(), "Shutting down Gazebo and ROS...");
+                // Use system command to kill Gazebo
+                std::system("pkill -f 'ign gazebo' 2>/dev/null");
+                std::system("pkill -f 'gz sim' 2>/dev/null");
+                rclcpp::shutdown();
+            });
+    }
+    else if (respawn_on_delete_)
+    {
+        // Respawn a new ball (if respawn is enabled)
+        auto respawn_timer = this->create_wall_timer(
+            std::chrono::milliseconds(500),
+            [this]() {
+                this->launch_ball();
+            });
+    }
 }
 
 }  // namespace ballvac_ball_collector

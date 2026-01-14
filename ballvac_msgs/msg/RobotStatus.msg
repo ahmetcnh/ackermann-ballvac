@@ -13,10 +13,17 @@ uint8 NAVIGATING=1
 uint8 APPROACHING=2
 uint8 COLLECTING=3
 uint8 STUCK=4
+uint8 EXPLORING=5
 uint8 state
 
 # Current assignment (if any)
 string assigned_ball_id
+
+# Target ball ID (current pursuit target)
+string target_ball_id
+
+# Collected ball colors (for GUI display)
+string[] collected_ball_colors
 
 # Status flags
 bool is_operational

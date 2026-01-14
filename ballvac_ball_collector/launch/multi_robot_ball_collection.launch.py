@@ -36,38 +36,57 @@ from launch_ros.actions import Node, SetParameter, PushRosNamespace
 from ament_index_python.packages import get_package_share_directory
 
 
-def generate_robot_nav2_params(robot_name, nav2_params_path):
-    """Generate a per-robot Nav2 params file with correct frame/topic names."""
+def generate_robot_nav2_params(robot_name, robot_index, nav2_params_path):
+    """Generate a per-robot Nav2 params file with correct frame/topic names.
+    
+    Each robot uses its own map frame to avoid TF tree conflicts:
+    - ballvac1 (index 0): map frame 'map', map topic '/map'
+    - ballvac2 (index 1): map frame 'map2', map topic '/ballvac2/map'
+    - ballvac3 (index 2): map frame 'map3', map topic '/ballvac3/map'
+    """
     with open(nav2_params_path, 'r') as f:
         data = yaml.safe_load(f)
 
     odom_frame = f"{robot_name}/odom"
     lidar_frame = f"{robot_name}/lidar_link"
+    
+    # Determine robot-specific map frame and topic
+    if robot_index == 0:
+        robot_map_frame = 'map'
+        robot_map_topic = '/map'
+    elif robot_index == 1:
+        robot_map_frame = 'map2'
+        robot_map_topic = '/ballvac2/map'
+    else:
+        robot_map_frame = 'map3'
+        robot_map_topic = '/ballvac3/map'
 
-    # SLAM toolbox
+    # SLAM toolbox - uses robot-specific map frame
     slam_params = data.setdefault('slam_toolbox', {}).setdefault('ros__parameters', {})
     slam_params['base_frame'] = robot_name
     slam_params['odom_frame'] = odom_frame
     slam_params['scan_topic'] = f"/{robot_name}/scan"
+    slam_params['map_frame'] = robot_map_frame
 
-    # AMCL
+    # AMCL (not used in current setup, but keep consistent)
     amcl_params = data.setdefault('amcl', {}).setdefault('ros__parameters', {})
     amcl_params['base_frame_id'] = robot_name
     amcl_params['odom_frame_id'] = odom_frame
     amcl_params['scan_topic'] = f"/{robot_name}/scan"
+    amcl_params['global_frame_id'] = robot_map_frame
 
-    # BT Navigator
+    # BT Navigator - uses robot-specific map frame
     bt_params = data.setdefault('bt_navigator', {}).setdefault('ros__parameters', {})
     bt_params['robot_base_frame'] = robot_name
-    bt_params['global_frame'] = 'map'
+    bt_params['global_frame'] = robot_map_frame
     bt_params['odom_topic'] = f"/{robot_name}/odom"
 
-    # Behavior server - no spin for Ackermann, NO wait (causes pauses)
+    # Behavior server - uses robot-specific map frame
     behavior_params = data.setdefault('behavior_server', {}).setdefault('ros__parameters', {})
     behavior_params['robot_base_frame'] = robot_name
     behavior_params['local_frame'] = odom_frame
-    behavior_params['global_frame'] = 'map'
-    behavior_params['behavior_plugins'] = ['backup', 'drive_on_heading']  # Removed wait - causes pauses
+    behavior_params['global_frame'] = robot_map_frame
+    behavior_params['behavior_plugins'] = ['backup', 'drive_on_heading']
 
     # Velocity smoother
     smoother_params = data.setdefault('velocity_smoother', {}).setdefault('ros__parameters', {})
@@ -78,7 +97,7 @@ def generate_robot_nav2_params(robot_name, nav2_params_path):
     controller_params['robot_base_frame'] = robot_name
     controller_params['odom_topic'] = f"/{robot_name}/odom"
 
-    # Local costmap
+    # Local costmap - uses odom frame (correct)
     local_params = (
         data.setdefault('local_costmap', {})
         .setdefault('local_costmap', {})
@@ -91,15 +110,15 @@ def generate_robot_nav2_params(robot_name, nav2_params_path):
     local_scan['topic'] = f"/{robot_name}/scan"
     local_scan['sensor_frame'] = lidar_frame
 
-    # Global costmap
+    # Global costmap - uses robot-specific map frame and topic
     global_params = (
         data.setdefault('global_costmap', {})
         .setdefault('global_costmap', {})
         .setdefault('ros__parameters', {})
     )
     global_params['robot_base_frame'] = robot_name
-    global_params['global_frame'] = 'map'
-    global_params.setdefault('static_layer', {})['map_topic'] = '/map'
+    global_params['global_frame'] = robot_map_frame  # Robot-specific map frame
+    global_params.setdefault('static_layer', {})['map_topic'] = robot_map_topic  # Robot-specific map topic
     global_scan = global_params.setdefault('obstacle_layer', {}).setdefault('scan', {})
     global_scan['topic'] = f"/{robot_name}/scan"
     global_scan['sensor_frame'] = lidar_frame
@@ -114,6 +133,7 @@ def generate_robot_nav2_params(robot_name, nav2_params_path):
         yaml.safe_dump({robot_name: data}, f, default_flow_style=False)
 
     return temp_params_path
+
 
 
 def parse_initial_balls(world_sdf_path):
@@ -207,7 +227,7 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
         f.write(sdf_content)
     
     # Create per-robot Nav2 params with correct frames/topics
-    robot_nav2_params = generate_robot_nav2_params(robot_name, nav2_params)
+    robot_nav2_params = generate_robot_nav2_params(robot_name, robot_index, nav2_params)
 
     # Frame names for this robot
     base_frame = f"{robot_name}"
@@ -315,93 +335,79 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
     nodes.append(static_tf_camera)
     
     # =========================================================================
-    # 5. SLAM - ONLY first robot runs SLAM
-    # Other robots use odometry-only (nav_ball_collector uses reactive LiDAR control)
-    # This prevents map flickering and keeps robots stable
+    # Initial map -> odom transform to bootstrap SLAM
+    # Each robot needs its own map frame (map, map2, map3)
+    # This provides the initial TF connection so SLAM can start
+    # SLAM will override this with its own estimate once it starts mapping
     # =========================================================================
     if robot_index == 0:
-        # First robot runs SLAM and publishes map
-        slam_node = Node(
-            package='slam_toolbox',
-            executable='async_slam_toolbox_node',
-            name='slam_toolbox',
-            namespace=robot_name,
-            output='screen',
-            parameters=[
-                robot_nav2_params,
-                {
-                    'use_sim_time': True,
-                    'base_frame': base_frame,
-                    'odom_frame': odom_frame,
-                    'scan_topic': f'/{robot_name}/scan',
-                    'map_frame': 'map',
-                }
-            ],
-            remappings=[
-                ('map', '/map'),
-                ('map_metadata', '/map_metadata'),
-                *tf_remaps,
-            ]
-        )
-        nodes.append(slam_node)
+        initial_map_frame = 'map'
+    elif robot_index == 1:
+        initial_map_frame = 'map2'
     else:
-        # Other robots use AMCL for localization on the shared map
-        amcl_node = Node(
-            package='nav2_amcl',
-            executable='amcl',
-            name='amcl',
-            namespace=robot_name,
-            output='screen',
-            parameters=[
-                robot_nav2_params,
-                {
-                    'use_sim_time': True,
-                    'base_frame_id': base_frame,
-                    'odom_frame_id': odom_frame,
-                    'global_frame_id': 'map',
-                    'scan_topic': f'/{robot_name}/scan',
-                    'map_topic': '/map',
-                    'robot_model_type': 'nav2_amcl::DifferentialMotionModel',
-                    'tf_broadcast': True,
-                    'transform_tolerance': 1.0,
-                    'alpha1': 0.2,
-                    'alpha2': 0.2,
-                    'alpha3': 0.2,
-                    'alpha4': 0.2,
-                    'alpha5': 0.2,
-                    'laser_likelihood_max_dist': 2.0,
-                    'laser_max_range': 12.0,
-                    'laser_min_range': 0.2,
-                    'laser_model_type': 'likelihood_field',
-                    'max_beams': 60,
-                    'max_particles': 2000,
-                    'min_particles': 500,
-                    'pf_err': 0.05,
-                    'pf_z': 0.99,
-                    'recovery_alpha_fast': 0.1,
-                    'recovery_alpha_slow': 0.001,
-                    'resample_interval': 1,
-                    'update_min_a': 0.2,
-                    'update_min_d': 0.15,
-                    'z_hit': 0.5,
-                    'z_max': 0.05,
-                    'z_rand': 0.5,
-                    'z_short': 0.05,
-                    'set_initial_pose': True,
-                    'always_reset_initial_pose': True,
-                    'first_map_only': False,
-                    'initial_pose.x': spawn_x,
-                    'initial_pose.y': spawn_y,
-                    'initial_pose.z': 0.0,
-                    'initial_pose.yaw': spawn_yaw,
-                }
-            ],
-            remappings=[
-                ('map', '/map'),
-                *tf_remaps,
-            ]
-        )
-        nodes.append(amcl_node)
+        initial_map_frame = 'map3'
+    
+    # Convert spawn yaw to quaternion for static transform
+    import math
+    qz = math.sin(spawn_yaw / 2.0)
+    qw = math.cos(spawn_yaw / 2.0)
+    
+    initial_map_to_odom = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name=f'{robot_name}_initial_map_to_odom',
+        arguments=[
+            str(spawn_x), str(spawn_y), '0',  # x, y, z
+            '0', '0', str(qz), str(qw),  # qx, qy, qz, qw
+            initial_map_frame, odom_frame  # parent, child
+        ],
+        parameters=[{'use_sim_time': True}],
+        remappings=tf_remaps,
+    )
+    nodes.append(initial_map_to_odom)
+    
+    # =========================================================================
+    # 5. SLAM - Each robot builds its OWN independent map
+    # ballvac1: map frame 'map', publishes to /map
+    # ballvac2: map frame 'map2', publishes to /ballvac2/map
+    # ballvac3: map frame 'map3', publishes to /ballvac3/map
+    # Each robot ONLY uses its own map for costmap - no cross-robot map sharing
+    # =========================================================================
+    
+    # Each robot gets its own unique map frame to prevent TF conflicts
+    if robot_index == 0:
+        robot_map_frame = 'map'
+        robot_map_topic = '/map'
+    elif robot_index == 1:
+        robot_map_frame = 'map2'
+        robot_map_topic = '/ballvac2/map'
+    else:
+        robot_map_frame = 'map3'
+        robot_map_topic = '/ballvac3/map'
+    
+    slam_node = Node(
+        package='slam_toolbox',
+        executable='async_slam_toolbox_node',
+        name='slam_toolbox',
+        namespace=robot_name,
+        output='screen',
+        parameters=[
+            robot_nav2_params,
+            {
+                'use_sim_time': True,
+                'base_frame': base_frame,
+                'odom_frame': odom_frame,
+                'scan_topic': f'/{robot_name}/scan',
+                'map_frame': robot_map_frame,  # Unique map frame per robot
+            }
+        ],
+        remappings=[
+            ('map', robot_map_topic),  # Unique map topic per robot
+            ('map_metadata', f'/{robot_name}/map_metadata'),
+            *tf_remaps,
+        ]
+    )
+    nodes.append(slam_node)
     # =========================================================================
     # 6. Nav2 Stack
     # =========================================================================
@@ -518,14 +524,14 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
                     'global_costmap.global_costmap.resolution': 0.05,
                     'global_costmap.global_costmap.origin_x': -10.0,
                     'global_costmap.global_costmap.origin_y': -10.0,
-                    'global_costmap.global_costmap.global_frame': 'map',
+                    'global_costmap.global_costmap.global_frame': robot_map_frame,
                     'global_costmap.global_costmap.robot_base_frame': base_frame,
                     'global_costmap.global_costmap.footprint': '[[0.18, 0.08], [0.18, -0.08], [-0.18, -0.08], [-0.18, 0.08]]',
                     'global_costmap.global_costmap.track_unknown_space': True,
                     'global_costmap.global_costmap.plugins': ['static_layer', 'obstacle_layer', 'inflation_layer'],
                     'global_costmap.global_costmap.static_layer.plugin': 'nav2_costmap_2d::StaticLayer',
                     'global_costmap.global_costmap.static_layer.map_subscribe_transient_local': True,
-                    'global_costmap.global_costmap.static_layer.map_topic': '/map',
+                    'global_costmap.global_costmap.static_layer.map_topic': robot_map_topic,
                     'global_costmap.global_costmap.obstacle_layer.plugin': 'nav2_costmap_2d::ObstacleLayer',
                     'global_costmap.global_costmap.obstacle_layer.enabled': True,
                     'global_costmap.global_costmap.obstacle_layer.observation_sources': 'scan',
@@ -630,7 +636,7 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
         ),
     ]
     
-    # Lifecycle manager - add AMCL for non-SLAM robots
+    # Lifecycle manager - all robots use SLAM now (no AMCL)
     lifecycle_nodes = [
         'controller_server',
         'planner_server',
@@ -638,9 +644,6 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
         'bt_navigator',
         'velocity_smoother',
     ]
-    if robot_index != 0:
-        # AMCL robots need AMCL in lifecycle
-        lifecycle_nodes.insert(0, 'amcl')
     
     lifecycle_manager = Node(
         package='nav2_lifecycle_manager',
@@ -996,5 +999,19 @@ def generate_launch_description():
         TimerAction(
             period=2.0,
             actions=[rviz]
+        ),
+        
+        # Stage 7: Robot State Monitor GUI (5s delay)
+        TimerAction(
+            period=5.0,
+            actions=[
+                Node(
+                    package='ballvac_ball_collector',
+                    executable='robot_state_monitor.py',
+                    name='robot_state_monitor',
+                    output='screen',
+                    parameters=[{'use_sim_time': True}]
+                )
+            ]
         ),
     ])

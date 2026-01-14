@@ -21,6 +21,8 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <array>
+#include <set>
 
 namespace ballvac_ball_collector
 {
@@ -95,6 +97,11 @@ private:
                        std::string & ambient, 
                        std::string & diffuse,
                        std::string & emissive);
+    
+    /**
+     * @brief Check if a position is valid for ball spawn (not too close to robots or obstacles)
+     */
+    bool is_valid_spawn_position(double x, double y);
 
     // =========================================================================
     // ROS 2 interfaces
@@ -150,6 +157,27 @@ private:
         double y;
     };
     std::vector<SpawnedBall> spawned_balls_;
+    
+    // Track collection progress for Gazebo shutdown
+    int initial_ball_count_;          // Total balls spawned at start
+    int collected_ball_count_;        // Number of balls collected
+    rclcpp::Time spawn_start_time_;   // When balls were first spawned
+    bool completion_announced_;       // Prevent duplicate completion messages
+    std::set<std::string> collected_balls_;  // Track which balls have been collected
+    
+    // =========================================================================
+    // Spawn Collision Prevention - positions to avoid
+    // =========================================================================
+    
+    // Robot spawn positions {x, y}
+    static constexpr std::array<std::pair<double, double>, 3> ROBOT_SPAWN_POSITIONS = {{
+        {0.0, -4.0},    // ballvac1
+        {-3.5, 2.0},    // ballvac2
+        {3.5, 2.0},     // ballvac3
+    }};
+    
+    static constexpr double MIN_ROBOT_DISTANCE = 2.0;     // Min distance from robot spawns
+    static constexpr double MIN_OBSTACLE_DISTANCE = 1.0;  // Min distance from obstacles
 };
 
 }  // namespace ballvac_ball_collector

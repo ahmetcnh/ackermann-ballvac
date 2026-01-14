@@ -363,7 +363,18 @@ NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
         "/fleet/ball_positions",
         rclcpp::SensorDataQoS());
     
-    // Fleet coordination subscribers/publishers
+    // ALWAYS create robot status publisher for GUI monitoring
+    // This works regardless of fleet coordinator mode
+    robot_status_pub_ = this->create_publisher<ballvac_msgs::msg::RobotStatus>(
+        robot_status_topic_,
+        rclcpp::QoS(50).reliable());
+    
+    // Heartbeat timer - publish status every 2 seconds for GUI
+    heartbeat_timer_ = this->create_wall_timer(
+        std::chrono::seconds(2),
+        std::bind(&NavBallCollectorNode::heartbeat_timer_callback, this));
+    
+    // Fleet coordination subscribers/publishers (only if fleet coordinator is enabled)
     if (use_fleet_coordinator_)
     {
         assignment_sub_ = this->create_subscription<ballvac_msgs::msg::RobotAssignment>(
@@ -376,15 +387,6 @@ NavBallCollectorNode::NavBallCollectorNode(const rclcpp::NodeOptions & options)
             "/fleet/ball_registry",
             rclcpp::QoS(10).reliable().transient_local(),
             std::bind(&NavBallCollectorNode::ball_registry_callback, this, std::placeholders::_1));
-        
-        robot_status_pub_ = this->create_publisher<ballvac_msgs::msg::RobotStatus>(
-            robot_status_topic_,
-            rclcpp::QoS(50).reliable());
-        
-        // Heartbeat timer - publish status every 2 seconds
-        heartbeat_timer_ = this->create_wall_timer(
-            std::chrono::seconds(2),
-            std::bind(&NavBallCollectorNode::heartbeat_timer_callback, this));
     }
     
     // Publishers
@@ -496,24 +498,45 @@ void NavBallCollectorNode::odom_callback(const nav_msgs::msg::Odometry::SharedPt
 void NavBallCollectorNode::deleted_ball_callback(const std_msgs::msg::String::SharedPtr msg)
 {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    const std::string & deleted_name = msg->data;
-    if (deleted_name.empty())
+    
+    // Message format: "ball_name" or "ball_name:robot_id"
+    std::string data = msg->data;
+    if (data.empty())
     {
         return;
     }
-
-    collected_balls_.insert(deleted_name);
+    
+    std::string deleted_name;
+    std::string deleter_robot;
+    size_t sep = data.find(':');
+    if (sep != std::string::npos)
+    {
+        deleted_name = data.substr(0, sep);
+        deleter_robot = data.substr(sep + 1);
+    }
+    else
+    {
+        deleted_name = data;
+        deleter_robot = "";
+    }
+    
+    // Only add to collected_balls_ if THIS robot deleted it
+    // (for GUI to show per-robot collections)
+    if (deleter_robot == robot_id_ || deleter_robot.empty())
+    {
+        collected_balls_.insert(deleted_name);
+    }
+    
+    // Always remove from claimed_balls_ (any robot's deletion)
     claimed_balls_.erase(deleted_name);
 
     bool target_matches = target_ball_.valid &&
         (target_ball_.name == deleted_name ||
          deleted_name == (target_ball_.name + "_2"));
 
-    if (target_matches)
+    if (target_matches && deleter_robot != robot_id_)
     {
-        // RCLCPP_INFO(this->get_logger(),
-        // "Target '%s' was deleted by another robot - returning to explore",
-        // target_ball_.name.c_str());
+        // Another robot deleted our target - return to explore
         cancel_navigation();
         target_ball_.valid = false;
         transition_to(NavCollectorState::EXPLORING);
@@ -666,7 +689,8 @@ void NavBallCollectorNode::heartbeat_timer_callback()
 
 void NavBallCollectorNode::publish_robot_status(uint8_t action, const std::string & action_ball_id)
 {
-    if (!use_fleet_coordinator_ || !robot_status_pub_)
+    // Always publish robot status for monitoring (GUI)
+    if (!robot_status_pub_)
     {
         return;
     }
@@ -691,7 +715,7 @@ void NavBallCollectorNode::publish_robot_status(uint8_t action, const std::strin
             msg.state = ballvac_msgs::msg::RobotStatus::IDLE;
             break;
         case NavCollectorState::EXPLORING:
-            msg.state = ballvac_msgs::msg::RobotStatus::IDLE;
+            msg.state = ballvac_msgs::msg::RobotStatus::EXPLORING;
             break;
         case NavCollectorState::NAVIGATING:
             msg.state = ballvac_msgs::msg::RobotStatus::NAVIGATING;
@@ -708,6 +732,29 @@ void NavBallCollectorNode::publish_robot_status(uint8_t action, const std::strin
     }
     
     msg.assigned_ball_id = has_active_assignment_ ? current_assignment_.ball_id : "";
+    
+    // Target ball ID for GUI display
+    if (target_ball_.valid)
+    {
+        msg.target_ball_id = target_ball_.color;
+    }
+    
+    // Collected ball colors for GUI display
+    for (const auto& ball_name : collected_balls_)
+    {
+        // Extract color from ball name (e.g., "ball_red" -> "red")
+        std::string color = ball_name;
+        if (color.find("ball_") == 0) {
+            color = color.substr(5);
+        }
+        // Remove any suffix (e.g., "_1", "_2")
+        size_t underscore_pos = color.find('_');
+        if (underscore_pos != std::string::npos) {
+            color = color.substr(0, underscore_pos);
+        }
+        msg.collected_ball_colors.push_back(color);
+    }
+    
     msg.is_operational = true;
     msg.navigation_ready = nav_to_pose_client_->wait_for_action_server(std::chrono::milliseconds(10));
     
@@ -1066,6 +1113,17 @@ void NavBallCollectorNode::detection_callback(const ballvac_msgs::msg::BallDetec
         if (is_ball_claimed_by_other(det.name))
         {
             continue;
+        }
+        
+        // Skip balls with large radius (close) if claimed by another robot
+        // This prevents multiple robots racing to the same close ball
+        if (det.apparent_size > approach_radius_threshold_ * 0.7)
+        {
+            // Ball is close - check if any other robot is heading there
+            if (is_ball_claimed_by_other(det.name))
+            {
+                continue;  // Let the closer/claiming robot handle it
+            }
         }
         
         int priority = get_color_priority(det.color);
@@ -3500,6 +3558,46 @@ void NavBallCollectorNode::publish_cmd_vel(float linear, float angular)
 
 void NavBallCollectorNode::delete_entity(const std::string & /*entity_name*/)
 {
+    // Check if this ball was already collected (by us or another robot)
+    // This prevents trying to delete a ball that was already deleted
+    if (target_ball_.valid)
+    {
+        // Check if the exact ball name or any variant is already collected
+        bool already_collected = false;
+        for (const auto& collected : collected_balls_)
+        {
+            // Check exact match or color match
+            if (collected == target_ball_.name ||
+                collected.find(target_ball_.color) != std::string::npos ||
+                target_ball_.name.find(collected) != std::string::npos)
+            {
+                already_collected = true;
+                break;
+            }
+        }
+        
+        // Also check claimed_balls_ to see if another robot is handling this
+        if (is_ball_claimed_by_other(target_ball_.name))
+        {
+            RCLCPP_INFO(this->get_logger(), 
+                "Ball '%s' claimed by another robot - skipping deletion",
+                target_ball_.name.c_str());
+            target_ball_.valid = false;
+            transition_to(NavCollectorState::EXPLORING);
+            return;
+        }
+        
+        if (already_collected)
+        {
+            RCLCPP_INFO(this->get_logger(), 
+                "Ball '%s' already collected - skipping deletion",
+                target_ball_.name.c_str());
+            target_ball_.valid = false;
+            transition_to(NavCollectorState::EXPLORING);
+            return;
+        }
+    }
+    
     if (!latest_odom_)
     {
         // RCLCPP_ERROR(this->get_logger(), "No odometry - cannot determine position for deletion");
@@ -3630,9 +3728,9 @@ void NavBallCollectorNode::delete_entity(const std::string & /*entity_name*/)
         collected_balls_.insert(nearest_ball);
         // RCLCPP_INFO(this->get_logger(), "Added '%s' to collected set", nearest_ball.c_str());
 
-        // Publish deletion event
+        // Publish deletion event with robot_id
         auto delete_msg = std_msgs::msg::String();
-        delete_msg.data = nearest_ball;
+        delete_msg.data = nearest_ball + ":" + robot_id_;
         ball_deleted_pub_->publish(delete_msg);
         
         if (use_fleet_coordinator_)
@@ -3699,9 +3797,9 @@ void NavBallCollectorNode::delete_entity_callback(
             // "Successfully collected ball '%s' (deleted: %s)!", 
             // target_ball_.name.c_str(), current_delete_name_.c_str());
 
-            // Publish deletion event for other robots (and optional respawn)
+            // Publish deletion event for other robots with robot_id
             auto delete_msg = std_msgs::msg::String();
-            delete_msg.data = current_delete_name_;
+            delete_msg.data = current_delete_name_ + ":" + robot_id_;
             ball_deleted_pub_->publish(delete_msg);
             
             // Notify fleet coordinator (if enabled)

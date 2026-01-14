@@ -190,9 +190,11 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Install Python test scripts
+# Install Python scripts
 install(
-  PROGRAMS scripts/test_steering.py
+  PROGRAMS 
+    scripts/test_steering.py
+    scripts/robot_state_monitor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
