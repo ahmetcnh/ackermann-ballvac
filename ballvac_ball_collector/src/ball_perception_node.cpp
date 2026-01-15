@@ -103,28 +103,77 @@ void BallPerceptionNode::initialize_color_ranges()
 {
     // HSV ranges tuned for typical colored balls in simulation
     // H: 0-179, S: 0-255, V: 0-255 in OpenCV
+    // IMPORTANT: Each color must have EXCLUSIVE hue ranges - NO OVERLAPS!
+    // Hue spectrum: 0=Red, 15=Orange, 25=Yellow, 40=Lime, 60=Green, 90=Teal, 95=Cyan, 110=Blue, 140=Purple, 165=Pink, 175=Red
     
     // RED - needs two ranges because red wraps around in HSV
-    // Range 1: Low red (0-10)
-    // Range 2: High red (160-179)
+    // Hue: 0-7 and 175-179 (exclusive)
     ColorRange red;
     red.name = "red";
-    red.lower1 = cv::Scalar(0, 70, 50);
-    red.upper1 = cv::Scalar(10, 255, 255);
-    red.lower2 = cv::Scalar(160, 70, 50);
+    red.lower1 = cv::Scalar(0, 100, 100);
+    red.upper1 = cv::Scalar(7, 255, 255);
+    red.lower2 = cv::Scalar(175, 100, 100);
     red.upper2 = cv::Scalar(179, 255, 255);
     red.has_secondary = true;
     color_ranges_.push_back(red);
 
-    // GREEN
+    // ORANGE - RGB (1.0, 0.5, 0.0) -> H=30°/2=15
+    // Widened range to catch Gazebo lighting variations
+    // Hue: 5-25 (wider to catch lighting-shifted orange)
+    ColorRange orange;
+    orange.name = "orange";
+    orange.lower1 = cv::Scalar(5, 120, 120);  // Higher S/V minimum for better detection
+    orange.upper1 = cv::Scalar(25, 255, 255);
+    orange.has_secondary = false;
+    color_ranges_.push_back(orange);
+
+    // YELLOW - pure yellow (shifted to avoid orange overlap)
+    // Hue: 26-35 (was 21-32)
+    ColorRange yellow;
+    yellow.name = "yellow";
+    yellow.lower1 = cv::Scalar(26, 100, 100);
+    yellow.upper1 = cv::Scalar(35, 255, 255);
+    yellow.has_secondary = false;
+    color_ranges_.push_back(yellow);
+
+    // LIME - RGB (0.5, 1.0, 0.0) -> H=90°/2=45
+    // Hue: 33-55 (exclusive)
+    ColorRange lime;
+    lime.name = "lime";
+    lime.lower1 = cv::Scalar(33, 100, 100);
+    lime.upper1 = cv::Scalar(55, 255, 255);
+    lime.has_secondary = false;
+    color_ranges_.push_back(lime);
+
+    // GREEN - pure green
+    // Hue: 56-80 (exclusive)
     ColorRange green;
     green.name = "green";
-    green.lower1 = cv::Scalar(35, 100, 100);
-    green.upper1 = cv::Scalar(85, 255, 255);
+    green.lower1 = cv::Scalar(56, 100, 100);
+    green.upper1 = cv::Scalar(80, 255, 255);
     green.has_secondary = false;
     color_ranges_.push_back(green);
 
-    // BLUE
+    // TEAL - RGB (0.0, 0.5, 0.5) -> H=180°/2=90
+    // Hue: 81-92 (exclusive), lower Value to differentiate from cyan
+    ColorRange teal;
+    teal.name = "teal";
+    teal.lower1 = cv::Scalar(81, 80, 40);
+    teal.upper1 = cv::Scalar(92, 255, 180);  // V capped at 180 (darker)
+    teal.has_secondary = false;
+    color_ranges_.push_back(teal);
+
+    // CYAN - RGB (0, 1.0, 1.0) -> H=180°/2=90
+    // Hue: 81-99, but higher Value (brighter than teal)
+    ColorRange cyan;
+    cyan.name = "cyan";
+    cyan.lower1 = cv::Scalar(81, 80, 181);   // V > 180 (brighter)
+    cyan.upper1 = cv::Scalar(99, 255, 255);
+    cyan.has_secondary = false;
+    color_ranges_.push_back(cyan);
+
+    // BLUE - pure blue
+    // Hue: 100-130 (exclusive)
     ColorRange blue;
     blue.name = "blue";
     blue.lower1 = cv::Scalar(100, 100, 100);
@@ -132,65 +181,23 @@ void BallPerceptionNode::initialize_color_ranges()
     blue.has_secondary = false;
     color_ranges_.push_back(blue);
 
-    // CYAN/TURQUOISE - bright blue-green color
-    ColorRange cyan;
-    cyan.name = "cyan";
-    cyan.lower1 = cv::Scalar(85, 100, 100);  // Hue 85-95 for bright cyan (shifted to avoid teal overlap)
-    cyan.upper1 = cv::Scalar(95, 255, 255);
-    cyan.has_secondary = false;
-    color_ranges_.push_back(cyan);
-
-    // ORANGE - between red and yellow
-    ColorRange orange;
-    orange.name = "orange";
-    orange.lower1 = cv::Scalar(11, 70, 50);
-    orange.upper1 = cv::Scalar(21, 255, 255);
-    orange.has_secondary = false;
-    color_ranges_.push_back(orange);
-
-    // YELLOW - starts after orange range
-    ColorRange yellow;
-    yellow.name = "yellow";
-    yellow.lower1 = cv::Scalar(22, 100, 100);  // Start at 22 to avoid orange overlap
-    yellow.upper1 = cv::Scalar(35, 255, 255);
-    yellow.has_secondary = false;
-    color_ranges_.push_back(yellow);
-
-    // PURPLE/MAGENTA - RGB (0.6, 0.0, 0.8) from ball_launcher
-    // In HSV: H=280°/2=140 (OpenCV), high saturation, medium-high value
+    // PURPLE - RGB (0.6, 0.0, 0.8) -> H=280°/2=140
+    // Hue: 131-155 (exclusive)
     ColorRange purple;
     purple.name = "purple";
-    purple.lower1 = cv::Scalar(125, 80, 80);   // Widened: H:125-160
-    purple.upper1 = cv::Scalar(160, 255, 255);
+    purple.lower1 = cv::Scalar(131, 80, 80);
+    purple.upper1 = cv::Scalar(155, 255, 255);
     purple.has_secondary = false;
     color_ranges_.push_back(purple);
 
-    // PINK - light red/magenta with high value
-    // Widened range to catch more pink variations
+    // PINK - RGB (1.0, 0.0, 0.5) -> H=330°/2=165
+    // Hue: 156-174 (exclusive)
     ColorRange pink;
     pink.name = "pink";
-    pink.lower1 = cv::Scalar(135, 40, 120);  // Widened: H:135-175, S:40+, V:120+
-    pink.upper1 = cv::Scalar(175, 255, 255);
+    pink.lower1 = cv::Scalar(156, 80, 100);
+    pink.upper1 = cv::Scalar(174, 255, 255);
     pink.has_secondary = false;
     color_ranges_.push_back(pink);
-
-    // LIME - yellow-green
-    ColorRange lime;
-    lime.name = "lime";
-    lime.lower1 = cv::Scalar(30, 100, 100);
-    lime.upper1 = cv::Scalar(50, 255, 255);
-    lime.has_secondary = false;
-    color_ranges_.push_back(lime);
-
-    // TEAL - RGB (0.0, 0.5, 0.5) from ball_launcher  
-    // In HSV: H=180°/2=90 (OpenCV), medium saturation (~50%), medium value (~50%)
-    // Teal is darker and less saturated than cyan - use Value threshold to differentiate
-    ColorRange teal;
-    teal.name = "teal";
-    teal.lower1 = cv::Scalar(85, 50, 50);   // H:85-95 overlaps with cyan, but lower V range
-    teal.upper1 = cv::Scalar(95, 200, 180); // Cap saturation and value at 200/180 (teal is darker)
-    teal.has_secondary = false;
-    color_ranges_.push_back(teal);
 }
 
 // =============================================================================

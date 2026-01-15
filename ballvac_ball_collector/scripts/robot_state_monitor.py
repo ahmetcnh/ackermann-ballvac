@@ -64,9 +64,9 @@ class RobotStateMonitor(Node):
         
         self.gui_callback = gui_callback
         self.robot_states = {
-            'ballvac1': {'state': 'IDLE', 'target': '', 'collected': []},
-            'ballvac2': {'state': 'IDLE', 'target': '', 'collected': []},
-            'ballvac3': {'state': 'IDLE', 'target': '', 'collected': []},
+            'ballvac1': {'state': 'IDLE', 'target': '', 'collected': [], 'detected': [], 'total_collected': 0},
+            'ballvac2': {'state': 'IDLE', 'target': '', 'collected': [], 'detected': [], 'total_collected': 0},
+            'ballvac3': {'state': 'IDLE', 'target': '', 'collected': [], 'detected': [], 'total_collected': 0},
         }
         
         # QoS for status messages
@@ -122,24 +122,33 @@ class RobotStateMonitor(Node):
         else:
             self.robot_states[robot_id]['target'] = ''
         
-        # Update collected balls from collected_ball_colors array
+        # Update collected balls from collected_ball_colors array (unique colors only)
         if msg.collected_ball_colors:
-            self.robot_states[robot_id]['collected'] = list(msg.collected_ball_colors)
+            # Use set to remove duplicates, then convert back to list
+            unique_colors = list(set(msg.collected_ball_colors))
+            self.robot_states[robot_id]['collected'] = unique_colors
+        
+        # Update total collected count
+        self.robot_states[robot_id]['total_collected'] = msg.total_collected
+        
+        # Update detected balls (currently visible)
+        if msg.detected_ball_colors:
+            self.robot_states[robot_id]['detected'] = list(set(msg.detected_ball_colors))
+        else:
+            self.robot_states[robot_id]['detected'] = []
     
     def ball_deleted_callback(self, msg: String):
-        """Handle ball deletion events to track collections."""
+        """Handle ball deletion events - just for logging, not for tracking.
+        
+        NOTE: We do NOT update robot_states here because:
+        1. status_callback already receives collected_ball_colors from each robot's RobotStatus
+        2. Adding here would cause duplicate entries when multiple balls of same color exist
+        3. Each robot correctly tracks its own collected_balls_ internally
+        """
         data = msg.data
         if ':' in data:
             ball_name, robot_id = data.split(':', 1)
-        else:
-            ball_name = data
-            robot_id = None
-        
-        color = ball_name.replace('ball_', '')
-        
-        if robot_id and robot_id in self.robot_states:
-            if color not in self.robot_states[robot_id]['collected']:
-                self.robot_states[robot_id]['collected'].append(color)
+            self.get_logger().debug(f'Ball {ball_name} collected by {robot_id}')
     
     def completion_callback(self, msg: String):
         """Handle completion message from ball_launcher."""
@@ -264,30 +273,55 @@ class RobotStateGUI:
         )
         target_label.pack(side='left', padx=5)
         
-        # Collected balls section
+        # Collected balls section with count only (no colored circles)
         collected_frame = tk.Frame(frame, bg='#3D3D3D')
-        collected_frame.pack(fill='x', padx=10, pady=10)
+        collected_frame.pack(fill='x', padx=10, pady=5)
+        
+        collected_header = tk.Frame(collected_frame, bg='#3D3D3D')
+        collected_header.pack(fill='x')
         
         tk.Label(
-            collected_frame,
+            collected_header,
             text='Collected:',
+            font=('Helvetica', 10),
+            bg='#3D3D3D',
+            fg='#AAAAAA'
+        ).pack(side='left')
+        
+        count_label = tk.Label(
+            collected_header,
+            text='0',
+            font=('Helvetica', 14, 'bold'),
+            bg='#3D3D3D',
+            fg='#00FF00'
+        )
+        count_label.pack(side='left', padx=5)
+        
+        # Detected balls section (with colored circles)
+        detected_frame = tk.Frame(frame, bg='#3D3D3D')
+        detected_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Label(
+            detected_frame,
+            text='Detected:',
             font=('Helvetica', 10),
             bg='#3D3D3D',
             fg='#AAAAAA'
         ).pack(anchor='w')
         
-        balls_container = tk.Frame(collected_frame, bg='#3D3D3D')
-        balls_container.pack(fill='x', pady=5)
+        detected_container = tk.Frame(detected_frame, bg='#3D3D3D')
+        detected_container.pack(fill='x', pady=2)
         
         return {
             'frame': frame,
             'state_label': state_label,
             'target_label': target_label,
-            'balls_container': balls_container,
-            'ball_widgets': []
+            'count_label': count_label,
+            'detected_container': detected_container,
+            'detected_widgets': []
         }
     
-    def update_robot_state(self, robot_name: str, state: str, target: str, collected: list):
+    def update_robot_state(self, robot_name: str, state: str, target: str, collected: list, detected: list = None, total_collected: int = 0):
         """Update the display for a robot."""
         if robot_name not in self.robot_cards:
             return
@@ -312,21 +346,28 @@ class RobotStateGUI:
         # Update target
         card['target_label'].config(text=target if target else 'None')
         
-        # Update collected balls
-        current_count = len(card['ball_widgets'])
-        for i, color in enumerate(collected):
-            if i >= current_count:
-                ball_color = BALL_COLORS.get(color, '#888888')
-                ball = tk.Canvas(
-                    card['balls_container'],
-                    width=20,
-                    height=20,
-                    bg='#3D3D3D',
-                    highlightthickness=0
-                )
-                ball.create_oval(2, 2, 18, 18, fill=ball_color, outline='#FFFFFF')
-                ball.pack(side='left', padx=2)
-                card['ball_widgets'].append(ball)
+        # Update collected ball count
+        card['count_label'].config(text=str(total_collected))
+        
+        # Update detected balls (clear and recreate each time since they can change)
+        if detected is None:
+            detected = []
+        for widget in card['detected_widgets']:
+            widget.destroy()
+        card['detected_widgets'] = []
+        
+        for color in detected:
+            ball_color = BALL_COLORS.get(color, '#888888')
+            ball = tk.Canvas(
+                card['detected_container'],
+                width=16,
+                height=16,
+                bg='#3D3D3D',
+                highlightthickness=0
+            )
+            ball.create_oval(1, 1, 15, 15, fill=ball_color, outline='#666666')
+            ball.pack(side='left', padx=1)
+            card['detected_widgets'].append(ball)
     
     def update_status_bar(self, text: str):
         """Update the status bar."""
@@ -345,7 +386,9 @@ def gui_update_callback(gui: RobotStateGUI, states: dict, completion_time=None):
                 robot_name,
                 data['state'],
                 data['target'],
-                data['collected']
+                data['collected'],
+                data.get('detected', []),
+                data.get('total_collected', 0)
             )
         
         if completion_time:

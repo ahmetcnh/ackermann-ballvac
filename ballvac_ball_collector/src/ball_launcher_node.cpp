@@ -654,15 +654,16 @@ void BallLauncherNode::ball_deleted_callback(const std_msgs::msg::String::Shared
                               (seconds < 10 ? "0" : "") + std::to_string(seconds);
         launch_info_pub_->publish(completion_msg);
         
-        // Shutdown Gazebo after 3 seconds
+        // Shutdown ONLY Gazebo after 3 seconds - keep GUI alive to show results
         auto shutdown_timer = this->create_wall_timer(
             std::chrono::seconds(3),
             [this]() {
-                RCLCPP_INFO(this->get_logger(), "Shutting down Gazebo and ROS...");
-                // Use system command to kill Gazebo
-                std::system("pkill -f 'ign gazebo' 2>/dev/null");
-                std::system("pkill -f 'gz sim' 2>/dev/null");
-                rclcpp::shutdown();
+                RCLCPP_INFO(this->get_logger(), "Sending SIGINT to Gazebo (GUI will remain)...");
+                // Use SIGINT (-2) for graceful shutdown - Gazebo handles this properly
+                std::system("pkill -2 -f 'ign gazebo' 2>/dev/null");
+                std::system("pkill -2 -f 'gz sim' 2>/dev/null");
+                std::system("pkill -2 -f 'ruby.*ign.*gazebo' 2>/dev/null");
+                // GUI (robot_state_monitor.py) will stay alive to display results
             });
     }
     else if (respawn_on_delete_)

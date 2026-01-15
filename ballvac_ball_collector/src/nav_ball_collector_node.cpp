@@ -522,9 +522,27 @@ void NavBallCollectorNode::deleted_ball_callback(const std_msgs::msg::String::Sh
     
     // Only add to collected_balls_ if THIS robot deleted it
     // (for GUI to show per-robot collections)
-    if (deleter_robot == robot_id_ || deleter_robot.empty())
+    // CRITICAL: Only match exact robot_id, NOT empty deleter_robot
+    if (!deleter_robot.empty() && deleter_robot == robot_id_)
     {
-        collected_balls_.insert(deleted_name);
+        // Extract color from deleted_name (e.g., "ball_yellow" -> "yellow")
+        std::string color = deleted_name;
+        if (color.find("ball_") == 0) {
+            color = color.substr(5);
+        }
+        // Remove suffix (e.g., "yellow_1" -> "yellow")
+        size_t underscore = color.find('_');
+        if (underscore != std::string::npos) {
+            color = color.substr(0, underscore);
+        }
+        collected_balls_.insert(color);
+        RCLCPP_INFO(this->get_logger(), "Added color '%s' to MY collected_balls_ (I am %s)",
+            color.c_str(), robot_id_.c_str());
+    }
+    else if (!deleter_robot.empty() && deleter_robot != robot_id_)
+    {
+        RCLCPP_DEBUG(this->get_logger(), "Ball '%s' collected by %s (not me: %s)",
+            deleted_name.c_str(), deleter_robot.c_str(), robot_id_.c_str());
     }
     
     // Always remove from claimed_balls_ (any robot's deletion)
@@ -740,19 +758,20 @@ void NavBallCollectorNode::publish_robot_status(uint8_t action, const std::strin
     }
     
     // Collected ball colors for GUI display
-    for (const auto& ball_name : collected_balls_)
+    // Note: collected_balls_ now contains only color names (e.g., "yellow", not "ball_yellow")
+    for (const auto& color : collected_balls_)
     {
-        // Extract color from ball name (e.g., "ball_red" -> "red")
-        std::string color = ball_name;
-        if (color.find("ball_") == 0) {
-            color = color.substr(5);
-        }
-        // Remove any suffix (e.g., "_1", "_2")
-        size_t underscore_pos = color.find('_');
-        if (underscore_pos != std::string::npos) {
-            color = color.substr(0, underscore_pos);
-        }
         msg.collected_ball_colors.push_back(color);
+    }
+    
+    // Total number of balls collected
+    msg.total_collected = static_cast<uint32_t>(collected_balls_.size());
+    
+    // Currently detected/targeted ball color
+    // Note: We only show the current target ball since detection array is not stored
+    if (target_ball_.valid && !target_ball_.color.empty())
+    {
+        msg.detected_ball_colors.push_back(target_ball_.color);
     }
     
     msg.is_operational = true;
@@ -3724,9 +3743,8 @@ void NavBallCollectorNode::delete_entity(const std::string & /*entity_name*/)
             }
         }
 
-        // Add to collected set to prevent re-collection attempts
-        collected_balls_.insert(nearest_ball);
-        // RCLCPP_INFO(this->get_logger(), "Added '%s' to collected set", nearest_ball.c_str());
+        // Add to collected set to prevent re-collection attempts (use color only)
+        collected_balls_.insert(target_ball_.color);
 
         // Publish deletion event with robot_id
         auto delete_msg = std_msgs::msg::String();
@@ -3757,7 +3775,7 @@ void NavBallCollectorNode::delete_entity(const std::string & /*entity_name*/)
             spawn_ball_with_name(target_ball_.color, nearest_ball);
         }
         
-        collected_balls_.insert(nearest_ball);
+        // Note: collection already tracked above with target_ball_.color
         
         target_ball_.valid = false;
         transition_to(NavCollectorState::EXPLORING);
@@ -3808,9 +3826,9 @@ void NavBallCollectorNode::delete_entity_callback(
                 publish_collected(target_ball_.name);
             }
             
-            // Track collection
-            collected_balls_.insert(current_delete_name_);
-            collected_balls_.insert(target_ball_.name);
+            // Track collection - insert ONLY the color name to avoid duplicates
+            // (current_delete_name_ might be "ball_yellow", target_ball_.name might be different)
+            collected_balls_.insert(target_ball_.color);  // Just the color: "yellow", not "ball_yellow"
             ball_collect_count_[target_ball_.color]++;
             last_collection_time_ = this->now();
             

@@ -25,6 +25,12 @@ string target_ball_id
 # Collected ball colors (for GUI display)
 string[] collected_ball_colors
 
+# Currently detected/visible ball colors (for GUI display)
+string[] detected_ball_colors
+
+# Total number of balls collected by this robot
+uint32 total_collected
+
 # Status flags
 bool is_operational
 bool navigation_ready

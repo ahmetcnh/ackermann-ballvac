@@ -50,16 +50,11 @@ def generate_robot_nav2_params(robot_name, robot_index, nav2_params_path):
     odom_frame = f"{robot_name}/odom"
     lidar_frame = f"{robot_name}/lidar_link"
     
-    # Determine robot-specific map frame and topic
-    if robot_index == 0:
-        robot_map_frame = 'map'
-        robot_map_topic = '/map'
-    elif robot_index == 1:
-        robot_map_frame = 'map2'
-        robot_map_topic = '/ballvac2/map'
-    else:
-        robot_map_frame = 'map3'
-        robot_map_topic = '/ballvac3/map'
+    # Determine robot-specific map topic
+    # ALL robots use shared 'map' frame and /map topic
+    # Only ballvac1 runs SLAM and publishes the map, others use it
+    robot_map_frame = 'map'
+    robot_map_topic = '/map'  # Shared by all robots
 
     # SLAM toolbox - uses robot-specific map frame
     slam_params = data.setdefault('slam_toolbox', {}).setdefault('ros__parameters', {})
@@ -110,15 +105,30 @@ def generate_robot_nav2_params(robot_name, robot_index, nav2_params_path):
     local_scan['topic'] = f"/{robot_name}/scan"
     local_scan['sensor_frame'] = lidar_frame
 
-    # Global costmap - uses robot-specific map frame and topic
+    # Global costmap configuration
+    # - ballvac1 (robot_index=0): uses static map from SLAM + obstacle layer
+    # - ballvac2/3: uses rolling costmap (no static map dependency)
     global_params = (
         data.setdefault('global_costmap', {})
         .setdefault('global_costmap', {})
         .setdefault('ros__parameters', {})
     )
     global_params['robot_base_frame'] = robot_name
-    global_params['global_frame'] = robot_map_frame  # Robot-specific map frame
-    global_params.setdefault('static_layer', {})['map_topic'] = robot_map_topic  # Robot-specific map topic
+    global_params['global_frame'] = robot_map_frame
+    
+    if robot_index == 0:
+        # ballvac1: Use static map from SLAM
+        global_params['plugins'] = ['static_layer', 'obstacle_layer', 'inflation_layer']
+        global_params.setdefault('static_layer', {})['map_topic'] = robot_map_topic
+    else:
+        # ballvac2/3: Use rolling costmap - no static map dependency
+        # This allows them to navigate even when outside ballvac1's map
+        global_params['rolling_window'] = True
+        global_params['width'] = 20  # 20m x 20m rolling window (must be int)
+        global_params['height'] = 20
+        global_params['resolution'] = 0.05
+        global_params['plugins'] = ['obstacle_layer', 'inflation_layer']  # No static_layer
+    
     global_scan = global_params.setdefault('obstacle_layer', {}).setdefault('scan', {})
     global_scan['topic'] = f"/{robot_name}/scan"
     global_scan['sensor_frame'] = lidar_frame
@@ -335,19 +345,47 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
     nodes.append(static_tf_camera)
     
     # =========================================================================
-    # Initial map -> odom transform to bootstrap SLAM
-    # Each robot needs its own map frame (map, map2, map3)
-    # This provides the initial TF connection so SLAM can start
-    # SLAM will override this with its own estimate once it starts mapping
+    # 5. SLAM or Localization
+    # - ballvac1: runs SLAM and publishes /map
+    # - ballvac2/3: use AMCL for localization on ballvac1's map
     # =========================================================================
-    if robot_index == 0:
-        initial_map_frame = 'map'
-    elif robot_index == 1:
-        initial_map_frame = 'map2'
-    else:
-        initial_map_frame = 'map3'
     
-    # Convert spawn yaw to quaternion for static transform
+    robot_map_frame = 'map'
+    robot_map_topic = '/map'
+    
+    if robot_index == 0:
+        # First robot runs SLAM - builds and publishes the map
+        slam_node = Node(
+            package='slam_toolbox',
+            executable='async_slam_toolbox_node',
+            name='slam_toolbox',
+            namespace=robot_name,
+            output='screen',
+            parameters=[
+                robot_nav2_params,
+                {
+                    'use_sim_time': True,
+                    'base_frame': base_frame,
+                    'odom_frame': odom_frame,
+                    'scan_topic': f'/{robot_name}/scan',
+                    'map_frame': robot_map_frame,
+                }
+            ],
+            remappings=[
+                ('map', robot_map_topic),
+                ('map_metadata', '/map_metadata'),
+                *tf_remaps,
+            ]
+        )
+        nodes.append(slam_node)
+    # Note: ballvac2/3 do not run SLAM - they use static TF for map->odom
+    
+    # =========================================================================
+    # 5b. Static TF: map -> each robot's odom frame at spawn position
+    # This provides the initial map->odom transform for each robot
+    # SLAM will override this once it starts producing its own transforms
+    # CRITICAL: Each robot needs this to bootstrap its TF tree
+    # =========================================================================
     import math
     qz = math.sin(spawn_yaw / 2.0)
     qw = math.cos(spawn_yaw / 2.0)
@@ -359,55 +397,12 @@ def generate_robot_nodes(context, robot_name, robot_index, spawn_x, spawn_y, spa
         arguments=[
             str(spawn_x), str(spawn_y), '0',  # x, y, z
             '0', '0', str(qz), str(qw),  # qx, qy, qz, qw
-            initial_map_frame, odom_frame  # parent, child
+            robot_map_frame, odom_frame  # map -> ballvac1/odom, etc
         ],
         parameters=[{'use_sim_time': True}],
         remappings=tf_remaps,
     )
     nodes.append(initial_map_to_odom)
-    
-    # =========================================================================
-    # 5. SLAM - Each robot builds its OWN independent map
-    # ballvac1: map frame 'map', publishes to /map
-    # ballvac2: map frame 'map2', publishes to /ballvac2/map
-    # ballvac3: map frame 'map3', publishes to /ballvac3/map
-    # Each robot ONLY uses its own map for costmap - no cross-robot map sharing
-    # =========================================================================
-    
-    # Each robot gets its own unique map frame to prevent TF conflicts
-    if robot_index == 0:
-        robot_map_frame = 'map'
-        robot_map_topic = '/map'
-    elif robot_index == 1:
-        robot_map_frame = 'map2'
-        robot_map_topic = '/ballvac2/map'
-    else:
-        robot_map_frame = 'map3'
-        robot_map_topic = '/ballvac3/map'
-    
-    slam_node = Node(
-        package='slam_toolbox',
-        executable='async_slam_toolbox_node',
-        name='slam_toolbox',
-        namespace=robot_name,
-        output='screen',
-        parameters=[
-            robot_nav2_params,
-            {
-                'use_sim_time': True,
-                'base_frame': base_frame,
-                'odom_frame': odom_frame,
-                'scan_topic': f'/{robot_name}/scan',
-                'map_frame': robot_map_frame,  # Unique map frame per robot
-            }
-        ],
-        remappings=[
-            ('map', robot_map_topic),  # Unique map topic per robot
-            ('map_metadata', f'/{robot_name}/map_metadata'),
-            *tf_remaps,
-        ]
-    )
-    nodes.append(slam_node)
     # =========================================================================
     # 6. Nav2 Stack
     # =========================================================================
